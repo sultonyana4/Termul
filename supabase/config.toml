@@ -1,0 +1,3 @@
+[functions.termul-wallet-v1]
+# The function validates an opaque wallet-session bearer token itself.
+verify_jwt = false

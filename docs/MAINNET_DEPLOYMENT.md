@@ -1,5 +1,7 @@
 # TermulInvoices Arc Mainnet deployment runbook
 
+> Historical notes. The current contract is already deployed. Use the [wallet migration runbook](WALLET_MIGRATION.md) for this branch.
+
 The owner runs the signing and verification steps manually from WSL Ubuntu after reviewing Phase 1.1. Arc Mainnet uses chain ID `5042` (`0x13b2`), `https://rpc.mainnet.arc.io`, and native USDC with 18 decimals. Use [Arc network details](https://docs.arc.io/arc/references/connect-to-arc), [RPC endpoints](https://docs.arc.io/arc/references/rpc-endpoints), and [Arc gas and fees](https://docs.arc.io/arc/references/gas-and-fees.md).
 
 ## Read-only preflight and local build

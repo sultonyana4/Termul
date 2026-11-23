@@ -1,16 +1,11 @@
 import assert from 'node:assert/strict';
 import {
-  createWalletClient,
-  custom,
-  defineChain,
   encodeAbiParameters,
   encodeEventTopics,
   encodeFunctionData,
-  keccak256,
   parseUnits,
 } from 'viem';
 import {
-  broadcastSignedTransactionOnce,
   createPaymentSubmissionGate,
 } from '../src/payment-result.js';
 import {
@@ -20,14 +15,13 @@ import {
   submitInvoiceCreationOnce,
 } from '../src/invoice-creation.js';
 
-const chainId = 5042002;
-const contract = '0x0cc3b91fc603ef15d80b3c0e8db222e5988b8926';
+const chainId = 5042;
+const contract = '0x62209ab89631492e7943ef21baee792d430f5d0e';
 const merchant = '0x4d3e3dc6d280cdd8ba520f8e4b9ac3bf762bbdfe';
 const invoiceId = `0x${'ab'.repeat(32)}`;
 const amount = parseUnits('5', 18);
 const expiresAt = 1_794_329_999n;
-const signedTransaction = '0x02f86c';
-const hash = keccak256(signedTransaction);
+const hash = '0x' + '12'.repeat(32);
 const abi = [
   {
     type: 'function',
@@ -84,68 +78,22 @@ const readDeps = {
 }
 
 {
-  const signingChain = defineChain({
-    id: chainId,
-    name: 'Arc Testnet mock',
-    nativeCurrency: { name: 'USDC', symbol: 'USDC', decimals: 18 },
-    rpcUrls: { default: { http: ['https://rpc.invalid.test'] } },
-  });
-  const walletMethods = [];
-  const walletClient = createWalletClient({
-    account: merchant,
-    chain: signingChain,
-    transport: custom({
-      request: async ({ method, params }) => {
-        walletMethods.push(method);
-        if (method === 'eth_chainId') return `0x${chainId.toString(16)}`;
-        if (method === 'eth_signTransaction') {
-          assert.equal(params[0].from.toLowerCase(), merchant);
-          assert.equal(params[0].to.toLowerCase(), contract);
-          assert.equal(params[0].data.toLowerCase(), calldata.toLowerCase());
-          assert.equal(BigInt(params[0].value ?? 0), 0n);
-          return signedTransaction;
-        }
-        throw new Error(`Unexpected wallet RPC method: ${method}`);
-      },
-    }),
-  });
-  let broadcastCount = 0;
-  let waitHash = null;
+  let submitCount = 0;
   const attempt = await submitInvoiceCreationOnce({
     submit: async () => {
-      const serialized = await walletClient.signTransaction({
-        account: merchant,
-        chain: signingChain,
-        to: contract,
-        data: calldata,
-        value: 0n,
-        nonce: 8,
-        gas: 180000n,
-        maxFeePerGas: 24_000_000_000n,
-        maxPriorityFeePerGas: 0n,
-      });
-      return broadcastSignedTransactionOnce({
-        serializedTransaction: serialized,
-        broadcast: async (raw) => {
-          broadcastCount += 1;
-          assert.equal(raw, signedTransaction, 'The exact signed bytes are broadcast unchanged.');
-          throw new Error('already known: nonce too low: next nonce 9, tx nonce 8');
-        },
-      });
+      submitCount++;
+      throw Object.assign(new Error('Wallet reported an ambiguous submission'), { transactionHash: hash });
     },
     waitForReceipt: async (transactionHash) => {
-      waitHash = transactionHash;
+      assert.equal(transactionHash, hash);
       return successfulReceipt;
     },
     reconcile: (args) => reconcileInvoiceCreationAttempt({ expected, ...args, ...readDeps }),
   });
-  assert.equal(attempt.transactionHash, hash, 'The precomputed hash is retained when RPC says already known / nonce too low.');
-  assert.equal(waitHash, hash, 'Receipt waiting continues against the precomputed hash despite the broadcast error.');
-  assert.equal(attempt.result.status, 'created', 'Only a successful exact receipt and matching InvoiceCreated event confirm creation.');
-  assert.equal(attempt.result.transactionHash, hash);
-  assert.equal(attempt.ambiguous, true, 'The RPC error remains marked ambiguous even though reconciliation proves success.');
-  assert.equal(broadcastCount, 1, 'The raw signed transaction is broadcast exactly once.');
-  assert.deepEqual(walletMethods, ['eth_chainId', 'eth_signTransaction'], 'Privy signs only; no wallet eth_sendTransaction is used.');
+  assert.equal(attempt.transactionHash, hash);
+  assert.equal(attempt.result.status, 'created');
+  assert.equal(attempt.ambiguous, true);
+  assert.equal(submitCount, 1);
 }
 
 {

@@ -1,5 +1,7 @@
 # Termul Arc Mainnet readiness
 
+> Historical notes. The current contract is already deployed. Use the [wallet migration runbook](WALLET_MIGRATION.md) for this branch.
+
 ## Phase 1.1 checkpoint
 
 | Milestone | Status |

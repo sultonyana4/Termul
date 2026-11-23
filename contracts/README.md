@@ -1,5 +1,7 @@
 # Termul app — ArusPayInvoices contract on Arc Testnet
 
+> Historical notes. The current contract is already deployed. Use the [wallet migration runbook](../docs/WALLET_MIGRATION.md) for this branch.
+
 `ArusPayInvoices.sol` implements non-custodial invoice settlement using Arc's native-USDC interface. The Termul app is configured for the following Arc Testnet deployment:
 
 - Chain ID: `5042002`

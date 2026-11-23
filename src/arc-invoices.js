@@ -1,28 +1,15 @@
 import {
   createPublicClient,
-  createWalletClient,
-  custom,
   decodeEventLog,
   encodeFunctionData,
   formatUnits,
   getAddress,
   http,
-  keccak256,
   parseUnits,
-  parseTransaction,
   numberToHex,
-  recoverTransactionAddress,
 } from 'viem';
-import { isExpectedHexChainId, withTimeout } from './privy-wallets.js';
-import './wallet-diagnostics.css';
+import { assertWalletProvider, sameWallet } from './wallet-provider.js';
 import {
-  createSafeWalletDiagnostics,
-  formatSafeWalletDiagnostics,
-  isEvmConnectedWallet,
-  walletDiagnosticsNextStep,
-} from './privy-diagnostics.js';
-import {
-  broadcastSignedTransactionOnce,
   createPaymentSubmissionGate,
   getPaymentDisplayState,
   isAmbiguousPaymentError,
@@ -122,10 +109,6 @@ const invoiceAbi = [
 ];
 
 const publicClient = chain && createPublicClient({ chain, transport: http(ARC_RPC) });
-const rawTransactionClient = chain && createWalletClient({
-  chain,
-  transport: http(ARC_RPC, { retryCount: 0 }),
-});
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
 const shortAddress = (address) => `${address.slice(0, 6)}…${address.slice(-4)}`;
@@ -195,134 +178,55 @@ function showWalletStatus(address, message = '') {
   }
 }
 
-async function getProvider() {
-  const isEmbeddedWallet = ['privy', 'privy-v2'].includes(activeWalletType);
-  const fromPrivy = await window.arusPayPrivy?.getEthereumProvider?.({
-    address: activeWalletAddress,
-    walletClientType: activeWalletType,
-  });
-  const provider = fromPrivy || (isEmbeddedWallet || !chain?.testnet ? null : window.ethereum);
-  if (!provider?.request) {
-    if (isEmbeddedWallet) {
-      throw new Error('Privy recognizes this embedded wallet, but its connected provider is not available in this browser. Retry the read-only connection check; no signature or transaction was requested.');
-    }
-    if (activeWalletAddress) {
-      throw new Error('The connected wallet provider is not available. No signature or transaction was requested.');
-    }
-    throw new Error('Connect an Ethereum wallet through Privy to continue.');
-  }
-  return provider;
-}
-
-async function ensureWalletNetwork(provider) {
-  const chainIdHex = `0x${CHAIN_ID.toString(16)}`;
-  if (isExpectedHexChainId(await provider.request({ method: 'eth_chainId' }), CHAIN_ID)) return;
-  try {
-    await provider.request({ method: 'wallet_switchEthereumChain', params: [{ chainId: chainIdHex }] });
-  } catch (error) {
-    if (error?.code !== 4902) throw error;
-    await provider.request({
-      method: 'wallet_addEthereumChain',
-      params: [{
-        chainId: chainIdHex,
-        chainName: networkName,
-        nativeCurrency: chain.nativeCurrency,
-        rpcUrls: [ARC_RPC],
-        blockExplorerUrls: [EXPLORER],
-      }],
-    });
-    await provider.request({ method: 'wallet_switchEthereumChain', params: [{ chainId: chainIdHex }] });
-  }
-  if (!isExpectedHexChainId(await provider.request({ method: 'eth_chainId' }), CHAIN_ID)) {
-    throw new Error(`Switch to ${networkName} before signing this transaction.`);
-  }
-}
-
 async function getWallet() {
   await verifyInvoiceDeployment(publicClient, arcNetwork);
-  const selectedAddress = activeWalletAddress;
-  const walletType = activeWalletType;
-  const privyUserId = window.arusPayCurrentPrivyUserId;
-  if (!chain.testnet && (!selectedAddress || !privyUserId)) {
-    throw new Error('Connect your wallet through Privy to continue on Arc Mainnet.');
-  }
-  const provider = await getProvider();
-  await ensureWalletNetwork(provider);
-  const accounts = await provider.request({ method: 'eth_requestAccounts' });
-  if (!Array.isArray(accounts) || !accounts.length) throw new Error('No connected wallet was returned.');
-  const account = getAddress(accounts[0]);
-  const assertSelection = () => {
-    if (activeWalletAddress !== selectedAddress || activeWalletType !== walletType
-      || window.arusPayCurrentPrivyUserId !== privyUserId
-      || (selectedAddress && getAddress(selectedAddress) !== account)) {
-      throw new Error('The Privy wallet selection changed or the provider returned a different account.');
-    }
-  };
+  const bridge = window.termulWallet;
+  const selection = bridge?.getSelection();
+  if (!selection?.address || selection.chainId !== CHAIN_ID) throw new Error('Connect your wallet on Arc Mainnet.');
+  const provider = await bridge.getProvider(selection);
+  const account = getAddress(selection.address);
   const assertReadyToSign = async () => {
-    const connected = await provider.request({ method: 'eth_accounts' });
-    if (!Array.isArray(connected) || !connected[0] || getAddress(connected[0]) !== account) {
-      throw new Error('The wallet account changed. Start again from the selected wallet.');
-    }
-    if (!isExpectedHexChainId(await provider.request({ method: 'eth_chainId' }), CHAIN_ID)) {
-      throw new Error(`The wallet is no longer on ${networkName}.`);
-    }
-    assertSelection();
+    await assertWalletProvider(provider, account);
+    if (!sameWallet(selection, bridge.getSelection())) throw new Error('The connected wallet changed.');
+    if (!bridge.session.isAuthenticated()) throw new Error('Verify wallet ownership before continuing.');
   };
-  assertSelection();
-  const walletClient = createWalletClient({ account, chain, transport: custom(provider, { retryCount: 0 }) });
-  showWalletStatus(account);
-  return { account, provider, walletClient, walletType, privyUserId, assertReadyToSign };
+  await assertWalletProvider(provider, account);
+  return { account, provider, selection, assertReadyToSign };
 }
 
-async function sendInvoiceTransaction(wallet, functionName, args, value, fee, onSubmitted = () => {}) {
-  const { account, provider, walletClient, walletType, assertReadyToSign } = wallet;
-  const request = { account, chain, chainId: CHAIN_ID, to: CONTRACT_ADDRESS,
-    data: encodeFunctionData({ abi: invoiceAbi, functionName, args }), value, ...fee.parameters };
+async function sendInvoiceTransaction(wallet, functionName, args, value, fee, { reserve, submitted = () => {} } = {}) {
+  const { account, provider, assertReadyToSign } = wallet;
   await verifyInvoiceDeployment(publicClient, arcNetwork);
-  await assertReadyToSign();
-  if (!['privy', 'privy-v2'].includes(walletType)) {
-    const fees = Object.fromEntries(Object.entries(fee.parameters).map(([key, amount]) => [key, numberToHex(amount)]));
-    if (!chain.testnet) onSubmitted(null);
-    const hash = await provider.request({
-      method: 'eth_sendTransaction',
-      params: [{
-        from: account,
-        to: request.to,
-        data: request.data,
-        chainId: numberToHex(CHAIN_ID),
-        value: numberToHex(value),
-        ...fees,
-      }],
-    }).catch((error) => {
-      if (chain.testnet || error?.code === 4001) throw error;
-      throw new Error('The external wallet submission outcome is ambiguous.', { cause: error });
-    });
-    if (typeof hash !== 'string' || !/^0x[0-9a-f]{64}$/i.test(hash)) {
-      throw new Error('The wallet did not return a valid transaction hash.');
-    }
-    onSubmitted(hash);
-    return hash;
+  const nonce = await publicClient.getTransactionCount({ address: account, blockTag: 'pending' });
+  const { gas, maxFeePerGas, maxPriorityFeePerGas } = fee.parameters;
+  if (!Number.isSafeInteger(nonce) || nonce < 0 || gas <= 0n || maxFeePerGas < 20_000_000_000n
+    || maxPriorityFeePerGas < 0n || maxPriorityFeePerGas > maxFeePerGas || value < 0n || value > MAX_UINT256) {
+    throw new Error('The reviewed transaction nonce, amount or fees are invalid.');
   }
-  const prepared = await publicClient.prepareTransactionRequest(request);
-  await assertReadyToSign();
-  const serializedTransaction = await walletClient.signTransaction({ ...prepared, account, chain });
-  const signed = parseTransaction(serializedTransaction);
-  const signer = await recoverTransactionAddress({ serializedTransaction });
-  if (!['legacy', 'eip1559'].includes(signed.type) || signed.chainId !== CHAIN_ID || getAddress(signed.to) !== getAddress(request.to)
-    || signed.data !== request.data || (signed.value ?? 0n) !== value || signer !== account
-    || signed.nonce !== prepared.nonce || signed.gas !== fee.parameters.gas
-    || (fee.parameters.gasPrice !== undefined && signed.gasPrice !== fee.parameters.gasPrice)
-    || (fee.parameters.maxFeePerGas !== undefined && (signed.maxFeePerGas !== fee.parameters.maxFeePerGas
-      || signed.maxPriorityFeePerGas !== fee.parameters.maxPriorityFeePerGas))) {
-    throw new Error('The signed transaction differs from the reviewed invoice request.');
+  const tx = {
+    from: account, to: CONTRACT_ADDRESS, chainId: numberToHex(CHAIN_ID), nonce: numberToHex(nonce),
+    data: encodeFunctionData({ abi: invoiceAbi, functionName, args }), value: numberToHex(value),
+    gas: numberToHex(gas), maxFeePerGas: numberToHex(maxFeePerGas), maxPriorityFeePerGas: numberToHex(maxPriorityFeePerGas),
+  };
+  if (await publicClient.getBalance({ address: account }) < value + gas * maxFeePerGas) {
+    throw new Error('Insufficient native USDC for the invoice amount and network fee.');
   }
-  await verifyInvoiceDeployment(publicClient, arcNetwork);
   await assertReadyToSign();
-  onSubmitted(keccak256(serializedTransaction));
-  return broadcastSignedTransactionOnce({
-    serializedTransaction,
-    broadcast: (serialized) => rawTransactionClient.sendRawTransaction({ serializedTransaction: serialized }),
-  });
+  if (reserve) await reserve();
+  await assertReadyToSign();
+  submitted(null);
+  let hash;
+  try {
+    hash = await provider.request({ method: 'eth_sendTransaction', params: [tx] });
+  } catch (error) {
+    if (error?.code === 4001) throw error;
+    throw new Error('The wallet submission outcome is ambiguous.', { cause: error });
+  }
+  if (typeof hash !== 'string' || !/^0x[0-9a-f]{64}$/i.test(hash)) {
+    throw new Error('The wallet did not return a valid transaction hash.');
+  }
+  submitted(hash);
+  return hash;
 }
 
 function readInvoiceResult(result) {
@@ -363,9 +267,9 @@ function localPaymentAttemptKey(key, userId) {
 
 function getUncertainPaymentAttempt(merchant, invoiceId) {
   const key = paymentAttemptKey(merchant, invoiceId);
-  const userId = window.arusPayCurrentPrivyUserId || null;
+  const userId = window.termulCurrentWalletAddress || null;
   let persisted = null;
-  if (chain?.testnet === false && userId) {
+  if (userId) {
     try {
       const raw = window.localStorage.getItem(localPaymentAttemptKey(key, userId));
       persisted = raw && JSON.parse(raw);
@@ -374,37 +278,40 @@ function getUncertainPaymentAttempt(merchant, invoiceId) {
     }
   }
   const inMemory = uncertainPaymentAttempts.get(key);
-  const attempt = inMemory?.privyUserId === userId && (!persisted || inMemory.updatedAt >= persisted.updatedAt)
+  const attempt = inMemory?.ownerAddress === userId && (!persisted || inMemory.updatedAt >= persisted.updatedAt)
     ? inMemory : persisted;
   return attempt && attempt.merchant?.toLowerCase() === merchant.toLowerCase()
     && attempt.invoiceId?.toLowerCase() === invoiceId.toLowerCase()
-    && attempt.privyUserId === userId ? attempt : null;
+    && attempt.ownerAddress === userId ? attempt : null;
 }
 
 function setUncertainPaymentAttempt(merchant, invoiceId, payer, transactionHash = null, amount = null, submission = null) {
   const key = paymentAttemptKey(merchant, invoiceId);
+  const previous = getUncertainPaymentAttempt(merchant, invoiceId);
   const attempt = {
     merchant: getAddress(merchant),
     invoiceId,
     payer: payer ? getAddress(payer) : null,
-    transactionHash,
+    transactionHash: transactionHash || previous?.transactionHash || null,
     amount: amount === null || amount === undefined ? null : BigInt(amount).toString(),
     updatedAt: Date.now(),
-    privyUserId: submission ? submission.privyUserId : window.arusPayCurrentPrivyUserId || null,
+    ownerAddress: submission?.ownerAddress || window.termulCurrentWalletAddress || null,
+    attemptId: submission?.attemptId || previous?.attemptId || null,
+    legacy: previous?.legacy || false,
   };
-  if (chain?.testnet === false && attempt.privyUserId && attempt.payer) {
+  if (attempt.ownerAddress && attempt.payer) {
     try {
-      window.localStorage.setItem(localPaymentAttemptKey(key, attempt.privyUserId), JSON.stringify(attempt));
+      window.localStorage.setItem(localPaymentAttemptKey(key, attempt.ownerAddress), JSON.stringify(attempt));
     } catch {
-      if (submission && !submission.started) throw new Error('Browser storage must be available to recover a Mainnet payment.');
+      if (submission && !submission.started) throw new Error('Browser storage must be available to recover a payment.');
     }
   }
-  if (attempt.privyUserId === (window.arusPayCurrentPrivyUserId || null)) {
+  if (attempt.ownerAddress === (window.termulCurrentWalletAddress || null)) {
     uncertainPaymentAttempts.set(key, attempt);
     paymentReconciliationWatchComplete.delete(key);
-    if (attempt.privyUserId && attempt.payer) {
-      void metadataApi.savePaymentAttempt(merchant, invoiceId, attempt.payer, transactionHash)
-        .catch(() => showToast('The payment attempt could not sync to Supabase. Termul will continue checking the contract directly.'));
+    if (attempt.attemptId && attempt.transactionHash) {
+      void metadataApi.savePaymentAttempt(merchant, invoiceId, attempt.attemptId, attempt.transactionHash)
+        .catch(() => showToast('The payment recovery details could not sync. Termul continues checking the contract.'));
     }
   }
   return attempt;
@@ -412,20 +319,23 @@ function setUncertainPaymentAttempt(merchant, invoiceId, payer, transactionHash 
 
 function clearUncertainPaymentAttempt(merchant, invoiceId) {
   const key = paymentAttemptKey(merchant, invoiceId);
+  const attempt = getUncertainPaymentAttempt(merchant, invoiceId);
   uncertainPaymentAttempts.delete(key);
   paymentReconciliationWatchComplete.delete(key);
-  const userId = window.arusPayCurrentPrivyUserId;
-  if (userId) {
-    if (chain?.testnet === false) {
-      try { window.localStorage.removeItem(localPaymentAttemptKey(key, userId)); } catch { /* Read-only recovery stays available. */ }
+  const owner = window.termulCurrentWalletAddress;
+  if (owner && attempt) {
+    try { window.localStorage.removeItem(localPaymentAttemptKey(key, owner)); } catch { /* Keep cloud recovery available. */ }
+    if (attempt.attemptId || attempt.legacy) {
+      void metadataApi.clearPaymentAttempt(merchant, invoiceId, attempt.attemptId).catch(() => {});
     }
-    void metadataApi.clearPaymentAttempt(merchant, invoiceId).catch(() => {});
   }
 }
 
 function hydrateUncertainPaymentAttempt(merchant, invoiceId, row) {
-  if (!row || !window.arusPayCurrentPrivyUserId) return null;
+  const owner = window.termulCurrentWalletAddress;
+  if (!row || !owner) return null;
   try {
+    if (getAddress(row.payer_address).toLowerCase() !== owner) return null;
     const attempt = {
       merchant: getAddress(merchant),
       invoiceId,
@@ -433,7 +343,9 @@ function hydrateUncertainPaymentAttempt(merchant, invoiceId, row) {
       transactionHash: row.tx_hash || null,
       amount: null,
       updatedAt: Date.parse(row.updated_at) || Date.now(),
-      privyUserId: window.arusPayCurrentPrivyUserId,
+      ownerAddress: owner,
+      attemptId: row.attempt_id || null,
+      legacy: row.legacy === true,
     };
     uncertainPaymentAttempts.set(paymentAttemptKey(merchant, invoiceId), attempt);
     return attempt;
@@ -499,7 +411,7 @@ async function reconcileOnchainPayment({ merchant, invoiceId, amount, payer, tra
 
 function startPaymentReconciliationWatch({ merchant, invoiceId, amount = null, payer = null, initialResult }) {
   const key = paymentAttemptKey(merchant, invoiceId);
-  const watchUserId = window.arusPayCurrentPrivyUserId;
+  const watchUserId = window.termulCurrentWalletAddress;
   if (paymentReconciliationWatchers.has(key) || paymentReconciliationWatchComplete.has(key)) return;
   let expectedAmount = amount === null || amount === undefined ? null : BigInt(amount);
   let paidWithoutHashToastShown = false;
@@ -510,8 +422,8 @@ function startPaymentReconciliationWatch({ merchant, invoiceId, amount = null, p
   const watch = pollPaymentReconciliation({
     initialResult,
     intervalMs: (attempt) => attempt < 5 ? 2000 : Math.min(30000, 2000 * (2 ** Math.floor((attempt - 5) / 4))),
-    maxAttempts: Number.POSITIVE_INFINITY,
-    shouldContinue: () => window.arusPayCurrentPrivyUserId === watchUserId
+    maxAttempts: 20,
+    shouldContinue: () => window.termulCurrentWalletAddress === watchUserId
       && Boolean(getUncertainPaymentAttempt(merchant, invoiceId)),
     reconcile: async () => {
       const attempt = getUncertainPaymentAttempt(merchant, invoiceId);
@@ -530,7 +442,7 @@ function startPaymentReconciliationWatch({ merchant, invoiceId, amount = null, p
       });
     },
     onUpdate: async (outcome) => {
-      if (window.arusPayCurrentPrivyUserId !== watchUserId) return;
+      if (window.termulCurrentWalletAddress !== watchUserId) return;
       const attempt = getUncertainPaymentAttempt(merchant, invoiceId);
       if (!attempt) return;
       if (outcome.paymentTxHash && outcome.paymentTxHash !== attempt.transactionHash) {
@@ -581,7 +493,7 @@ function startPaymentReconciliationWatch({ merchant, invoiceId, amount = null, p
   }).finally(async () => {
     paymentReconciliationWatchers.delete(key);
     if (getUncertainPaymentAttempt(merchant, invoiceId)) {
-      if (window.arusPayCurrentPrivyUserId === watchUserId) paymentReconciliationWatchComplete.add(key);
+      if (window.termulCurrentWalletAddress === watchUserId) paymentReconciliationWatchComplete.add(key);
       await renderPayment();
     }
   });
@@ -733,17 +645,10 @@ async function estimateFee(functionName, args, account, value = 0n) {
   const request = { account, address: CONTRACT_ADDRESS, abi: invoiceAbi, functionName, args, value };
   const gas = await publicClient.estimateContractGas(request);
   const parameters = { gas };
-  let feeCap;
-  if (chain.testnet) {
-    parameters.gasPrice = await publicClient.getGasPrice();
-    feeCap = parameters.gasPrice;
-  } else {
-    const { maxFeePerGas, maxPriorityFeePerGas } = await publicClient.estimateFeesPerGas();
-    parameters.maxPriorityFeePerGas = maxPriorityFeePerGas;
-    parameters.maxFeePerGas = maxFeePerGas < 20_000_000_000n ? 20_000_000_000n : maxFeePerGas;
-    feeCap = parameters.maxFeePerGas;
-  }
-  const fee = gas * feeCap;
+  const { maxFeePerGas, maxPriorityFeePerGas } = await publicClient.estimateFeesPerGas();
+  parameters.maxPriorityFeePerGas = maxPriorityFeePerGas;
+  parameters.maxFeePerGas = maxFeePerGas < 20_000_000_000n ? 20_000_000_000n : maxFeePerGas;
+  const fee = gas * parameters.maxFeePerGas;
   if (await publicClient.getBalance({ address: account }) < value + fee) {
     throw new Error('Insufficient native USDC for the invoice amount and estimated network fee.');
   }
@@ -833,6 +738,8 @@ async function createOnchainInvoice() {
       const invoiceId = randomInvoiceId();
       const wallet = await getWallet();
       const { account } = wallet;
+      await window.termulWallet.session.authenticate({ fresh: true });
+      await wallet.assertReadyToSign();
       const expected = {
         chainId: CHAIN_ID,
         contract: CONTRACT_ADDRESS,
@@ -865,10 +772,12 @@ async function createOnchainInvoice() {
 
       let outcome = attempt.result;
       if (!['created', 'reverted', 'failed', 'unmatched'].includes(outcome.status)) {
-        updateStatus('Privy returned an ambiguous result. Checking the exact signed transaction and invoice event; do not retry or approve again.');
+        updateStatus('The wallet returned an ambiguous result. Checking the exact signed transaction and invoice event; do not retry or approve again.');
         showToast('The wallet response does not prove failure. Termul is checking this exact invoice transaction; no second transaction will be sent.');
         outcome = await pollInvoiceCreationReconciliation({
           initialResult: outcome,
+          maxAttempts: 30,
+          shouldContinue: () => sameWallet(wallet.selection, window.termulWallet?.getSelection()),
           reconcile: () => reconcile({
             transactionHash: attempt.transactionHash,
             receiptHint: attempt.receipt,
@@ -882,7 +791,7 @@ async function createOnchainInvoice() {
         });
       }
 
-      if (wallet.privyUserId !== window.arusPayCurrentPrivyUserId) return;
+      if (!sameWallet(wallet.selection, window.termulWallet?.getSelection())) return;
       if (outcome.status === 'created') {
         const hash = outcome.transactionHash;
         const record = {
@@ -976,8 +885,8 @@ async function renderPayment() {
   const requestId = ++paymentRenderRequest;
   const view = $('#payment-view');
   const selected = window.arusPayApi?.getSelectedInvoice();
-  const renderUserId = window.arusPayCurrentPrivyUserId;
-  const isCurrentRender = () => requestId === paymentRenderRequest && renderUserId === window.arusPayCurrentPrivyUserId;
+  const renderUserId = window.termulCurrentWalletAddress;
+  const isCurrentRender = () => requestId === paymentRenderRequest && renderUserId === window.termulCurrentWalletAddress;
   if (!selected?.merchant || !selected?.invoiceId) {
     renderPaymentUnavailable(sharedLinkError || arcNetwork.error || `Select an invoice or open a valid ${networkName} payment link.`);
     return;
@@ -1018,7 +927,7 @@ async function renderPayment() {
       if (paymentReconciliation.status === 'paid') {
         if ((paymentReconciliation.contractStatePending
             || (paymentReconciliation.proofUnavailable && !paymentReconciliation.paymentTxHash))
-          && !paymentAttempt) {
+          && !paymentAttempt && activeWalletAddress) {
           paymentAttempt = setUncertainPaymentAttempt(
             selected.merchant,
             selected.invoiceId,
@@ -1104,14 +1013,14 @@ async function renderPayment() {
       const stateMessage = document.createElement('p');
       stateMessage.className = 'hint';
       stateMessage.textContent = paymentReconciliation?.status === 'pending'
-        ? 'The contract still reports Open, but a matching payment transaction is pending. If Privy’s wallet popup still shows an error, close it with X—do not tap “Retry transaction” or approve again. Leave this page open while Termul checks the receipt; no second payment is being submitted.'
+        ? 'The contract still reports Open, but a matching payment transaction is pending. If Your wallet popup still shows an error, close it with X—do not tap “Retry transaction” or approve again. Leave this page open while Termul checks the receipt; no second payment is being submitted.'
         : paymentReconciliation?.status === 'unavailable'
           ? paymentReconciliationWatchers.has(paymentAttemptKey(selected.merchant, selected.invoiceId))
-            ? 'The last payment request has an uncertain result. If Privy’s wallet popup still shows an error, close it with X—do not tap “Retry transaction” or approve again. Leave this page open; Termul is checking the contract and payment events without submitting another payment.'
-            : 'The last payment request has an uncertain result, and the contract could not be re-read. Close any Privy error popup with X—do not tap “Retry transaction” or approve again. No second payment is available; leave this page open and check status again when the RPC responds.'
+            ? 'The last payment request has an uncertain result. If Your wallet popup still shows an error, close it with X—do not tap “Retry transaction” or approve again. Leave this page open; Termul is checking the contract and payment events without submitting another payment.'
+            : 'The last payment request has an uncertain result, and the contract could not be re-read. Dismiss the wallet message and check the current payment status. No second payment is available; leave this page open and check status again when the RPC responds.'
           : paymentReconciliationWatchers.has(paymentAttemptKey(selected.merchant, selected.invoiceId))
-            ? 'Privy’s wallet error or nonce message does not prove payment failed. Close the popup with X—do not tap “Retry transaction” or approve again. Leave this page open; Termul is checking the contract and matching payment events automatically, with payment locked.'
-            : 'Privy’s wallet error or nonce message does not prove payment failed. Close the popup with X—do not tap “Retry transaction” or approve again. The invoice still reads Open, so payment remains locked while Termul checks again.';
+            ? 'Your wallet error or nonce message does not prove payment failed. Dismiss the wallet message and check the current payment status. Leave this page open; Termul is checking the contract and matching payment events automatically, with payment locked.'
+            : 'Your wallet error or nonce message does not prove payment failed. Dismiss the wallet message and check the current payment status. The invoice still reads Open, so payment remains locked while Termul checks again.';
       resultPanel.append(stateMessage);
       if (paymentReconciliation?.status === 'pending' && paymentReconciliation.paymentTxHash) {
         const pendingLink = document.createElement('a');
@@ -1152,57 +1061,21 @@ async function renderPayment() {
       });
     }
     if (paymentButton) {
-      const isPrivyWallet = ['privy', 'privy-v2'].includes(activeWalletType);
-      const providerVerified = activeWalletProviderState === 'connected' && activeWalletProviderReady;
-      if (!activeWalletAddress) {
-        paymentButton.textContent = 'Connect wallet to pay';
-      } else if (activeWalletProviderState === 'checking') {
-        paymentButton.textContent = isPrivyWallet ? 'Checking Privy connection…' : 'Checking wallet network…';
-      } else if (!providerVerified) {
-        paymentButton.textContent = 'Wallet network not verified';
-      }
-      const walletHint = document.createElement('p');
-      walletHint.className = 'hint';
-      walletHint.setAttribute('role', 'status');
-      walletHint.textContent = !activeWalletAddress
-        ? 'Invoice status is read from the deployed invoice contract. Connect an Ethereum wallet to pay.'
-        : activeWalletProviderState === 'checking'
-          ? `Checking the ${isPrivyWallet ? 'Privy ' : ''}wallet provider and verifying ${networkName} (chain ID ${CHAIN_ID}) using a read-only request. No signature or transaction has been requested.`
-          : !providerVerified
-            ? activeWalletProviderError || `The wallet provider and ${networkName} network have not been verified. Review the safe connection diagnostics below; no signature or transaction was requested.`
-            : isPrivyWallet
-              ? `The Privy provider answered a read-only ${networkName} network check. Signing has not been tested here; no signature or transaction has been requested.`
-              : `Wallet provider for ${shortAddress(activeWalletAddress)} answered a read-only ${networkName} network check. No signature or transaction has been requested.`;
-      paymentButton.before(walletHint);
-      if (activeWalletAddress && !providerVerified) {
+      if (!activeWalletAddress) paymentButton.textContent = 'Connect wallet to pay';
+      if (activeWalletAddress && !activeWalletProviderReady) {
         paymentButton.disabled = true;
+        paymentButton.textContent = activeWalletProviderState === 'checking' ? 'Checking wallet…' : 'Wallet unavailable';
+        const hint = document.createElement('p');
+        hint.className = 'hint';
+        hint.textContent = activeWalletProviderError || 'Checking your wallet account and Arc Mainnet network.';
+        paymentButton.before(hint);
         if (activeWalletProviderState === 'unavailable') {
-          const diagnosticArgs = {
-            selectedWalletClientType: activeWalletType,
-            providerLookupState: activeEthereumProviderLookupState,
-            chainId: activeWalletChainId,
-          };
-          const diagnostics = window.arusPayPrivy?.getRuntimeDiagnostics?.(diagnosticArgs)
-            || createSafeWalletDiagnostics(diagnosticArgs);
-          paymentButton.after(createWalletDiagnosticsPanel(diagnostics));
-          if (activeWalletChainId && !isExpectedHexChainId(activeWalletChainId, CHAIN_ID)) {
-            const switchButton = document.createElement('button');
-            switchButton.type = 'button';
-            switchButton.className = 'btn btn-quiet btn-sm';
-            switchButton.textContent = `Switch wallet to ${networkName}`;
-            switchButton.addEventListener('click', async () => {
-              switchButton.disabled = true;
-              try {
-                await ensureWalletNetwork(await getProvider());
-                await checkActiveWalletProvider();
-              } catch (error) {
-                showToast(error?.message || 'Could not switch the wallet network.');
-              } finally {
-                switchButton.disabled = false;
-              }
-            });
-            paymentButton.after(switchButton);
-          }
+          const recovery = document.createElement('button');
+          recovery.type = 'button';
+          recovery.className = 'btn btn-quiet btn-sm';
+          recovery.textContent = activeWalletSelection?.chainId !== CHAIN_ID ? 'Switch to Arc Mainnet' : 'Check wallet connection';
+          recovery.addEventListener('click', () => void recoverWalletNetwork());
+          paymentButton.after(recovery);
         }
       }
     }
@@ -1217,12 +1090,8 @@ async function renderPayment() {
     });
     paymentButton?.addEventListener('click', () => {
       if (activeWalletAddress && (activeWalletProviderState !== 'connected' || !activeWalletProviderReady)) return;
-      if (!activeWalletAddress && (!chain.testnet || !window.ethereum?.request)) {
-        if (window.arusPayPrivy?.login) {
-          void window.arusPayPrivy.login('wallet');
-        } else {
-          showToast('Wallet connection is still loading. Try again shortly; no transaction was sent.');
-        }
+      if (!activeWalletAddress) {
+        window.termulWallet?.connect();
         return;
       }
       if (isCurrentRender()) void payInvoice(invoice.merchant, selected.invoiceId, invoice.amount);
@@ -1247,37 +1116,40 @@ async function payInvoice(merchant, invoiceId, amount) {
   const button = $('#pay-onchain');
   const run = () => runPaymentSubmissionIfIdle(async () => {
     if (getUncertainPaymentAttempt(merchant, invoiceId)) {
-      showToast('A previous payment result is still uncertain. Close any Privy error popup with X—do not tap “Retry transaction” or approve again. Check status; no second transaction was submitted.');
+      showToast('A previous payment result is still uncertain. Dismiss the wallet message and check the current payment status. Check status; no second transaction was submitted.');
       await renderPayment();
       return;
     }
     if (button) button.disabled = true;
     let submission;
     try {
-      if (chain?.testnet === false && window.arusPayCurrentPrivyUserId) {
-        const result = await metadataApi.getPaymentAttempt(merchant, invoiceId).catch((cause) => {
-          throw new Error('Termul could not check for a previous Mainnet payment. Check payment status again before paying.', { cause });
-        });
-        if (hydrateUncertainPaymentAttempt(merchant, invoiceId, result?.attempt)) {
-          await renderPayment();
-          return;
-        }
-      }
       const wallet = await getWallet();
       const { account } = wallet;
-      submission = { privyUserId: wallet.privyUserId || null, started: false };
+      submission = { ownerAddress: account.toLowerCase(), started: false, attemptId: null };
       const current = await getOnchainInvoice(merchant, invoiceId);
       if (current.status !== STATUS.open) throw new Error(`This invoice is ${statusText(current.status, current.expiresAt).toLowerCase()} and cannot be paid.`);
       if (current.expiresAt !== 0n && current.expiresAt <= BigInt(Math.floor(Date.now() / 1000))) throw new Error('This invoice has expired.');
       if (current.amount !== BigInt(amount)) throw new Error('The displayed amount no longer matches the on-chain invoice. Review the updated invoice before paying.');
+      await window.termulWallet.session.authenticate();
+      await wallet.assertReadyToSign();
+      const prior = await metadataApi.getPaymentAttempt(merchant, invoiceId);
+      if (hydrateUncertainPaymentAttempt(merchant, invoiceId, prior?.attempt)) {
+        await renderPayment();
+        return;
+      }
       const fee = await estimateFee('payInvoice', [getAddress(merchant), invoiceId], account, current.amount);
       showToast(`Review wallet confirmation for ${formatUsdc(amount)} USDC plus an estimated ${formatUsdc(fee.fee)} USDC network fee.`);
       const attempt = await submitPaymentOnce({
-        submit: () => sendInvoiceTransaction(wallet, 'payInvoice', [getAddress(merchant), invoiceId], current.amount, fee,
-          (hash) => {
+        submit: () => sendInvoiceTransaction(wallet, 'payInvoice', [getAddress(merchant), invoiceId], current.amount, fee, {
+          reserve: async () => {
+            const { attemptId } = await metadataApi.reservePaymentAttempt(merchant, invoiceId);
+            submission.attemptId = attemptId;
+          },
+          submitted: (hash) => {
             setUncertainPaymentAttempt(merchant, invoiceId, account, hash, current.amount, submission);
             submission.started = true;
-          }),
+          },
+        }),
         waitForReceipt: (hash) => publicClient.waitForTransactionReceipt({ hash, timeout: 45000, pollingInterval: 1500 }),
         reconcile: ({ transactionHash, receiptHint, error }) => reconcileOnchainPayment({
           merchant,
@@ -1289,7 +1161,11 @@ async function payInvoice(merchant, invoiceId, amount) {
           error,
         }),
       });
-      if (submission.privyUserId !== (window.arusPayCurrentPrivyUserId || null)) return;
+      if (!sameWallet(wallet.selection, window.termulWallet?.getSelection())) return;
+      if (!submission.started) {
+        if (submission.attemptId) await metadataApi.clearPaymentAttempt(merchant, invoiceId, submission.attemptId).catch(() => {});
+        throw attempt.error || new Error('No payment was sent.');
+      }
       const outcome = attempt.result;
       if (outcome.status === 'paid') {
         if (outcome.contractStatePending || (outcome.proofUnavailable && !outcome.paymentTxHash)) {
@@ -1341,10 +1217,10 @@ async function payInvoice(merchant, invoiceId, amount) {
         const ambiguousWalletResult = attempt.ambiguous || isAmbiguousPaymentError(attempt.error);
         showToast(outcome.status === 'unavailable'
           ? ambiguousWalletResult
-            ? 'Privy returned an ambiguous wallet or nonce message; it does not prove payment failed. Termul is checking the contract and payment events. No second payment was submitted.'
+            ? 'The wallet returned an ambiguous wallet or nonce message; it does not prove payment failed. Termul is checking the contract and payment events. No second payment was submitted.'
             : 'The contract status could not be verified. No second payment was submitted; check status again when the RPC responds.'
           : ambiguousWalletResult
-            ? 'Privy returned an ambiguous wallet or nonce message; it does not prove payment failed. Termul is checking the contract and payment events. No second payment was submitted.'
+            ? 'The wallet returned an ambiguous wallet or nonce message; it does not prove payment failed. Termul is checking the contract and payment events. No second payment was submitted.'
             : 'The result is not yet conclusive. No second payment was submitted; check wallet activity and contract status before deciding what to do.');
       }
     } catch (error) {
@@ -1355,7 +1231,7 @@ async function payInvoice(merchant, invoiceId, amount) {
     }
   });
   const locks = window.navigator.locks;
-  if (chain?.testnet === false && locks) {
+  if (locks) {
     return locks.request('termul.pay:' + paymentAttemptKey(merchant, invoiceId), { ifAvailable: true }, (lock) => {
       if (lock) return run();
       showToast('A payment for this invoice is already open in another tab.');
@@ -1391,12 +1267,10 @@ function openSharedInvoice(merchant, invoiceId) {
 window.arusPayUpdatePayment = renderPayment;
 window.arusPayCreateInvoice = createOnchainInvoice;
 let activeWalletAddress = null;
-let activeWalletType = '';
+let activeWalletSelection = null;
 let activeWalletProviderReady = false;
 let activeWalletProviderState = 'disconnected';
 let activeWalletProviderError = '';
-let activeEthereumProviderLookupState = 'not-started';
-let activeWalletChainId = null;
 let walletProviderProbeRequest = 0;
 let paymentRenderRequest = 0;
 let dashboardSyncRequest = 0;
@@ -1427,157 +1301,34 @@ function setInvoiceSyncStatus(message, error = '') {
   status.title = error;
 }
 
-function createWalletDiagnosticsPanel(diagnostics) {
-  const panel = document.createElement('section');
-  panel.className = 'wallet-diagnostics';
-  panel.setAttribute('aria-label', 'Safe wallet connection diagnostics');
-
-  const heading = document.createElement('strong');
-  heading.textContent = 'Safe connection diagnostics';
-  panel.append(heading);
-
-  const rows = [
-    ['Privy session', !diagnostics.privySessionReady
-      ? 'Initializing'
-      : diagnostics.privyAuthenticated ? 'Ready · authenticated' : 'Ready · not authenticated'],
-    ['useWallets.ready', String(diagnostics.useWalletsReady)],
-    ['Connected EVM wallets', `${diagnostics.connectedEvmWalletCount}${diagnostics.connectedEvmWalletTypes.length
-      ? ` · ${diagnostics.connectedEvmWalletTypes.join(', ')}`
-      : ''}`],
-    ['Selected wallet/provider type', diagnostics.selectedWalletProviderType],
-    ['getEthereumProvider', diagnostics.getEthereumProvider],
-    ['eth_chainId', diagnostics.ethChainId],
-  ];
-  const list = document.createElement('dl');
-  for (const [label, value] of rows) {
-    const row = document.createElement('div');
-    const term = document.createElement('dt');
-    const detail = document.createElement('dd');
-    term.textContent = label;
-    detail.textContent = value;
-    row.append(term, detail);
-    list.append(row);
-  }
-  panel.append(list);
-
-  const safeText = formatSafeWalletDiagnostics(diagnostics);
-  const text = document.createElement('pre');
-  text.className = 'wallet-diagnostics-text';
-  text.textContent = safeText;
-  panel.append(text);
-
-  const nextStep = document.createElement('p');
-  nextStep.textContent = walletDiagnosticsNextStep(diagnostics, chain);
-  panel.append(nextStep);
-
-  const copy = document.createElement('button');
-  copy.className = 'btn btn-quiet btn-sm';
-  copy.type = 'button';
-  copy.textContent = 'Copy safe diagnostics';
-  copy.addEventListener('click', async () => {
-    try {
-      await navigator.clipboard.writeText(safeText);
-      showToast('Safe wallet diagnostics copied. No wallet address or account details are included.');
-    } catch {
-      showToast('Clipboard access was blocked. Select the safe diagnostics shown above and copy them manually.');
+async function checkActiveWalletProvider(selection = activeWalletSelection) {
+  const request = ++walletProviderProbeRequest;
+  activeWalletProviderReady = false;
+  activeWalletProviderState = selection ? 'checking' : 'disconnected';
+  activeWalletProviderError = '';
+  try {
+    if (selection) {
+      if (selection.chainId !== CHAIN_ID) throw new Error('Switch your wallet to Arc Mainnet.');
+      await assertWalletProvider(await window.termulWallet.getProvider(selection), selection.address);
+      if (request !== walletProviderProbeRequest) return;
+      activeWalletProviderReady = true;
+      activeWalletProviderState = 'connected';
     }
-  });
-  panel.append(copy);
-  return panel;
+  } catch (error) {
+    if (request !== walletProviderProbeRequest) return;
+    activeWalletProviderState = 'unavailable';
+    activeWalletProviderError = error?.message || 'The connected wallet is unavailable.';
+  }
+  if (!$('#payment').classList.contains('hidden')) void renderPayment();
 }
 
-async function checkActiveWalletProvider(address = activeWalletAddress, walletClientType = activeWalletType) {
-  if (!address) return false;
-  const request = ++walletProviderProbeRequest;
-  const deadline = Date.now() + 12_000;
-  const expectedAddress = address.toLowerCase();
-  activeWalletProviderReady = false;
-  activeWalletProviderState = 'checking';
-  activeEthereumProviderLookupState = 'pending';
-  activeWalletChainId = null;
-  activeWalletProviderError = '';
-  if (!$('#payment').classList.contains('hidden') && window.arusPayApi?.getSelectedInvoice()) {
-    void renderPayment();
-  }
+async function recoverWalletNetwork() {
   try {
-    const getEthereumProvider = window.arusPayPrivy?.getEthereumProvider;
-    if (typeof getEthereumProvider !== 'function') {
-      activeEthereumProviderLookupState = 'rejected';
-      throw new Error('Privy wallet bridge is unavailable.');
-    }
-    const providerLookupRemaining = deadline - Date.now();
-    if (providerLookupRemaining <= 0) throw new Error('Privy provider lookup timed out.');
-    const provider = await withTimeout(
-      () => getEthereumProvider.call(window.arusPayPrivy, {
-        address,
-        walletClientType,
-        onProviderState: (state) => {
-          if (request === walletProviderProbeRequest && activeWalletAddress?.toLowerCase() === expectedAddress) {
-            activeEthereumProviderLookupState = state;
-          }
-        },
-      }),
-      providerLookupRemaining,
-      'Privy provider lookup timed out.',
-    );
-    if (!provider?.request) {
-      if (activeEthereumProviderLookupState === 'pending') activeEthereumProviderLookupState = 'timeout';
-      throw new Error('No connected wallet provider was returned.');
-    }
-    activeEthereumProviderLookupState = 'resolved';
-    const chainCheckRemaining = deadline - Date.now();
-    if (chainCheckRemaining <= 0) throw new Error('Privy read-only connection check timed out.');
-    const chainId = await withTimeout(
-      () => provider.request({ method: 'eth_chainId' }),
-      chainCheckRemaining,
-      'Privy read-only connection check timed out.',
-    );
-    if (typeof chainId !== 'string' || !/^0x[0-9a-f]+$/i.test(chainId)) {
-      throw new Error('The wallet provider did not return a valid chain ID.');
-    }
-    activeWalletChainId = chainId.toLowerCase();
-    if (!isExpectedHexChainId(chainId, CHAIN_ID)) {
-      throw new Error(`The connected wallet is not on ${networkName}.`);
-    }
-    if (request !== walletProviderProbeRequest || activeWalletAddress?.toLowerCase() !== expectedAddress) return false;
-    activeWalletProviderReady = true;
-    activeWalletProviderState = 'connected';
+    if (activeWalletSelection?.chainId !== CHAIN_ID) await window.termulWallet?.switchNetwork();
+    await checkActiveWalletProvider();
   } catch (error) {
-    if (request !== walletProviderProbeRequest || activeWalletAddress?.toLowerCase() !== expectedAddress) return false;
-    activeWalletProviderReady = false;
-    activeWalletProviderState = 'unavailable';
-    if (error?.message === 'Privy provider lookup timed out.'
-      || error?.message === 'No connected wallet provider was returned.') {
-      if (activeEthereumProviderLookupState === 'pending') activeEthereumProviderLookupState = 'timeout';
-    } else if (error?.message === 'Privy wallet bridge is unavailable.') {
-      activeEthereumProviderLookupState = 'rejected';
-    }
-    const diagnosticArgs = {
-      selectedWalletClientType: walletClientType,
-      providerLookupState: activeEthereumProviderLookupState,
-      chainId: activeWalletChainId,
-    };
-    const diagnostics = window.arusPayPrivy?.getRuntimeDiagnostics?.(diagnosticArgs)
-      || createSafeWalletDiagnostics(diagnosticArgs);
-    const nextStep = walletDiagnosticsNextStep(diagnostics, chain);
-    if (error?.message === 'Privy provider lookup timed out.') {
-      activeWalletProviderError = `Privy did not return a wallet provider within 12 seconds. ${nextStep} No signature or transaction was requested.`;
-    } else if (error?.message === 'Privy read-only connection check timed out.') {
-      activeWalletProviderError = `The wallet provider did not answer the read-only eth_chainId check within 12 seconds. ${nextStep} No signature or transaction was requested.`;
-    } else if (error?.message === `The connected wallet is not on ${networkName}.`) {
-      activeWalletProviderError = `The selected wallet is not on ${networkName}. ${nextStep} No signature or transaction was requested.`;
-    } else if (error?.message === 'The wallet provider did not return a valid chain ID.') {
-      activeWalletProviderError = `The wallet provider returned an invalid eth_chainId value. ${nextStep} No signature or transaction was requested.`;
-    } else if (activeEthereumProviderLookupState === 'rejected') {
-      activeWalletProviderError = `Privy rejected or could not start getEthereumProvider(). ${nextStep} No signature or transaction was requested.`;
-    } else {
-      activeWalletProviderError = `The read-only wallet provider check did not pass. ${nextStep} No signature or transaction was requested.`;
-    }
+    showToast(error?.message || 'The wallet could not switch networks.');
   }
-  if (!$('#payment').classList.contains('hidden') && window.arusPayApi?.getSelectedInvoice()) {
-    void renderPayment();
-  }
-  return activeWalletProviderReady;
 }
 
 async function refreshArcDashboard(address = activeWalletAddress) {
@@ -1634,65 +1385,22 @@ if (window.arusPayApi) window.arusPayApi.clearPaymentAttemptCache = clearLocalPa
   });
 });
 
-window.arusPayWalletChanged = (wallets = []) => {
-  const wallet = wallets.find(isEvmConnectedWallet);
-  if (wallet?.address) {
-    try {
-      const nextAddress = getAddress(wallet.address);
-      if (activeWalletAddress && activeWalletAddress.toLowerCase() !== nextAddress.toLowerCase()) {
-        window.arusPayApi?.clearInvoices(new URL(window.location.href).searchParams.has('invoiceId'));
-      }
-      activeWalletAddress = nextAddress;
-      activeWalletType = wallet.walletClientType || '';
-      activeWalletProviderReady = false;
-      activeWalletProviderState = 'checking';
-      activeWalletProviderError = '';
-      showWalletStatus(activeWalletAddress);
-      void checkActiveWalletProvider(activeWalletAddress, activeWalletType);
-      void refreshArcDashboard(activeWalletAddress);
-    } catch {
-      walletProviderProbeRequest += 1;
-      activeWalletAddress = null;
-      activeWalletType = '';
-      activeWalletProviderReady = false;
-      activeWalletProviderState = 'disconnected';
-      activeWalletProviderError = '';
-      activeEthereumProviderLookupState = 'not-started';
-      activeWalletChainId = null;
-      dashboardSyncRequest += 1;
-      setWalletBalance('—', 'Privy returned an invalid wallet address.');
-      setInvoiceSyncStatus('Invoice sync unavailable · check the connected wallet.');
-      window.arusPayApi?.setInvoiceSyncState('error');
-      ['#refresh-chain-sync', '#profile-refresh-chain-sync'].forEach((selector) => {
-        const button = $(selector);
-        if (button) button.disabled = false;
-      });
-    }
-    if (!$('#payment').classList.contains('hidden') && window.arusPayApi?.getSelectedInvoice()) {
-      void renderPayment();
-    }
-    return;
+window.termulInvoiceWalletChanged = (selection) => {
+  activeWalletSelection = selection;
+  activeWalletAddress = selection ? getAddress(selection.address) : null;
+  dashboardSyncRequest++;
+  showWalletStatus(activeWalletAddress);
+  void checkActiveWalletProvider(selection);
+  if (activeWalletAddress) {
+    void refreshArcDashboard(activeWalletAddress);
+  } else {
+    window.arusPayApi?.setInvoiceSyncState('disconnected');
+    setWalletBalance('—', 'Connect a wallet to read its balance.');
+    setInvoiceSyncStatus('Connect a wallet to sync Arc invoices.');
   }
-  walletProviderProbeRequest += 1;
-  activeWalletAddress = null;
-  activeWalletType = '';
-  activeWalletProviderReady = false;
-  activeWalletProviderState = 'disconnected';
-  activeWalletProviderError = '';
-  activeEthereumProviderLookupState = 'not-started';
-  activeWalletChainId = null;
-  dashboardSyncRequest += 1;
-  window.arusPayApi?.setInvoiceSyncState('disconnected');
-  ['#refresh-chain-sync', '#profile-refresh-chain-sync'].forEach((selector) => {
-    const button = $(selector);
-    if (button) button.disabled = false;
-  });
-  showWalletStatus('', window.arusPayAuthenticatedState ? 'Wallet not connected' : '');
-  setWalletBalance('—', 'Connect a Privy wallet to read its balance.');
-  setInvoiceSyncStatus('Connect a Privy wallet to sync Arc invoices.');
-  if (!$('#payment').classList.contains('hidden') && window.arusPayApi?.getSelectedInvoice()) {
-    void renderPayment();
-  }
+};
+window.termulRefreshPayment = () => {
+  if (!$('#payment').classList.contains('hidden')) void renderPayment();
 };
 
 window.arusPayConfig = Object.freeze({
@@ -1704,7 +1412,7 @@ window.arusPayConfig = Object.freeze({
 });
 $$('[data-arc-name]').forEach((label) => { label.textContent = networkName; });
 const environment = $('[data-arc-environment]');
-if (environment && !chain?.testnet) environment.textContent = arcNetwork.error || networkName;
+if (environment) environment.textContent = arcNetwork.error || networkName;
 if (arcNetwork.error) {
   const submit = $('#invoice-form [type="submit"]');
   if (submit) {
