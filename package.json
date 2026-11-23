@@ -13,11 +13,21 @@
     "test:invoice-creation": "node scripts/invoice-creation.test.mjs",
     "test:arc-network": "node scripts/arc-network.test.mjs",
     "test:wallet": "node scripts/wallet.test.mjs",
-    "test:siwe": "node scripts/wallet-api.test.mjs"
+    "test:siwe": "node scripts/wallet-api.test.mjs",
+    "test:transaction-dialog": "node scripts/transaction-dialog.test.mjs",
+    "test:swap": "node scripts/swap.test.mjs",
+    "test:any-token": "node scripts/any-token.test.mjs"
   },
   "dependencies": {
-    "@wagmi/core": "2.22.1",
-    "viem": "2.57.17"
+    "@wagmi/core": "3.6.9",
+    "viem": "2.57.17",
+    "wagmi": "3.7.11",
+    "@tanstack/react-query": "5.104.0",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "@lifi/widget": "4.11.0",
+    "@lifi/widget-provider-ethereum": "4.2.0",
+    "@lifi/sdk-provider-ethereum": "4.3.1"
   },
   "devDependencies": {
     "jsdom": "^31.0.0",

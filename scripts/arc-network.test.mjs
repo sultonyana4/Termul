@@ -48,7 +48,9 @@ const source = await readFile(new URL('../supabase/functions/_shared/termul-main
 const require = createRequire(import.meta.url);
 const abi = parseAbi([
   'function getInvoice(address merchant, bytes32 id) view returns ((address merchant, uint256 amount, uint64 expiresAt, uint8 status))',
+  'function createInvoice(bytes32 id, uint256 amount, uint64 expiresAt)',
   'function payInvoice(address merchant, bytes32 id) payable',
+  'event InvoiceCreated(bytes32 indexed invoiceId, address indexed merchant, uint256 amount, uint64 expiresAt)',
   'event InvoicePaid(bytes32 indexed invoiceId, address indexed merchant, address indexed payer, uint256 amount)',
 ]);
 const data = encodeFunctionData({ abi, functionName: 'payInvoice', args: [merchant, id] });
@@ -63,7 +65,7 @@ const transaction = { from: payer, to: address, input: data, value: numberToHex(
 
 async function runFrontend(options, exercise) {
   const { env = {}, params = tagged, rpcChain = 5042, walletAccount = payer, walletChain = 5042,
-    balance = 2n * amount, code = fixtureCode, offlineMetadata = false, onWalletSend } = options;
+    balance = 2n * amount, code = fixtureCode, offlineMetadata = false, onWalletSend, beforeReceipt } = options;
   const { outputFiles } = await build({
     entryPoints: ['src/arc-invoices.js'], absWorkingDir: new URL('..', import.meta.url).pathname,
     bundle: true, write: false, platform: 'node', packages: 'external', format: 'cjs',
@@ -75,17 +77,40 @@ async function runFrontend(options, exercise) {
   const { window } = new JSDOM(html, { url: 'https://termul.xyz/?' + params, runScripts: 'outside-only' });
   globalThis.window = window;
   globalThis.document = window.document;
+  const dialog = window.document.getElementById('transaction-dialog');
+  dialog.showModal = () => { dialog.open = true; };
+  dialog.close = () => { dialog.open = false; };
   window.eval(window.document.querySelector('script:not([src])').textContent);
   const rpcMethods = [];
   const walletMethods = [];
   const actions = [];
   let selected = null;
   let paid = options.paid || false;
+  let creation;
   let recovery = options.recovery || null;
   const provider = { request: async ({ method, params }) => {
     walletMethods.push(method);
     if (method === 'eth_chainId') return numberToHex(walletChain);
     if (method === 'eth_accounts') return [walletAccount];
+    if (method === 'eth_sendTransaction' && options.createInvoice) {
+      const tx = params[0];
+      const { functionName, args: [invoiceId, amount, expiresAt] } = decodeFunctionData({ abi, data: tx.data });
+      assert.equal(functionName, 'createInvoice');
+      assert.equal(tx.to, address);
+      assert.equal(tx.chainId, '0x13b2');
+      assert.equal(BigInt(tx.value), 0n);
+      const log = {
+        ...paidLog,
+        topics: encodeEventTopics({ abi, eventName: 'InvoiceCreated', args: { invoiceId, merchant: payer } }),
+        data: encodeAbiParameters([{ type: 'uint256' }, { type: 'uint64' }], [amount, expiresAt]),
+      };
+      creation = {
+        invoice: { merchant: payer, amount, expiresAt, status: 1 },
+        transaction: { ...transaction, input: tx.data, value: '0x0' },
+        receipt: { blockNumber: numberToHex(block), transactionHash: hash, status: '0x1', logs: [log] },
+      };
+      return hash;
+    }
     if (method === 'eth_sendTransaction' && onWalletSend) {
       await onWalletSend(params[0], window);
       paid = true;
@@ -129,14 +154,15 @@ async function runFrontend(options, exercise) {
     assert.equal(request.url, 'https://rpc.mainnet.arc.io/');
     const body = await request.json();
     rpcMethods.push(body.method);
+    if (paid && body.method === 'eth_getTransactionReceipt') await beforeReceipt?.();
     const result = {
       eth_chainId: numberToHex(rpcChain),
       eth_getCode: body.params?.[1] === numberToHex(block - 1n) ? '0x' : code,
-      eth_call: invoiceResult(paid ? 2 : 1),
+      eth_call: creation ? encodeFunctionResult({ abi, functionName: 'getInvoice', result: creation.invoice }) : invoiceResult(paid ? 2 : 1),
       eth_blockNumber: numberToHex(block),
       eth_getLogs: paid && body.params?.[0]?.topics?.[0] === paidLog.topics[0] ? [paidLog] : [],
-      eth_getTransactionByHash: paid ? transaction : null,
-      eth_getTransactionReceipt: paid ? { blockNumber: numberToHex(block), transactionHash: hash, status: '0x1', logs: [paidLog] } : null,
+      eth_getTransactionByHash: creation?.transaction || (paid ? transaction : null),
+      eth_getTransactionReceipt: creation?.receipt || (paid ? { blockNumber: numberToHex(block), transactionHash: hash, status: '0x1', logs: [paidLog] } : null),
       eth_estimateGas: '0x10000',
       eth_getBlockByNumber: { baseFeePerGas: '0x4a817c800', transactions: [] },
       eth_maxPriorityFeePerGas: '0x0',
@@ -224,7 +250,9 @@ await runFrontend({ paid: true }, async ({ $, walletMethods }) => {
 
 let release;
 const approval = new Promise(resolve => { release = resolve; });
-await runFrontend({ onWalletSend: async (tx, window) => {
+let releaseReceipt;
+const receipt = new Promise(resolve => { releaseReceipt = resolve; });
+await runFrontend({ beforeReceipt: () => receipt, onWalletSend: async (tx, window) => {
   assert.equal(tx.chainId, '0x13b2');
   assert.equal(tx.nonce, '0x7');
   assert.equal(tx.to, address);
@@ -240,13 +268,51 @@ await runFrontend({ onWalletSend: async (tx, window) => {
   const button = $('#pay-onchain');
   button.click();
   await waitFor(() => walletMethods.includes('eth_sendTransaction'));
+  assert.equal($('#transaction-dialog').dataset.phase, 'approval');
+  assert.equal($('[data-transaction-proof]').hidden, true);
   assert.ok(actions.includes('reserve_payment_attempt'));
   assert.equal($('#payment-view h1').textContent, 'Open');
   button.click();
   release();
+  await waitFor(() => $('#transaction-dialog').dataset.phase === 'submitted');
+  assert.equal($('[data-transaction-proof]').hidden, true);
+  releaseReceipt();
   await waitFor(() => $('#payment-view h1')?.textContent === 'Paid' && Boolean($('a[href="https://explorer.arc.io/tx/' + hash + '"]')));
+  assert.equal($('#transaction-dialog').dataset.phase, 'confirmed');
+  assert.equal($('[data-transaction-explorer]').href, 'https://explorer.arc.io/tx/' + hash);
+  assert.equal($('[data-transaction-amount]').textContent, '1.000000000000000001 USDC');
   assert.equal(walletMethods.filter(method => method === 'eth_sendTransaction').length, 1);
   assert.equal(window.localStorage.length, 0);
+});
+
+await runFrontend({ onWalletSend: async () => {
+  throw Object.assign(new Error('User rejected the request'), { code: 4001 });
+} }, async ({ $, connect, walletMethods, window }) => {
+  connect();
+  await ready($);
+  $('#pay-onchain').click();
+  await waitFor(() => $('#transaction-dialog').dataset.phase === 'rejected');
+  await ready($);
+  assert.equal($('[data-transaction-proof]').hidden, true);
+  assert.equal(window.localStorage.length, 0);
+  assert.equal(walletMethods.filter(method => method === 'eth_sendTransaction').length, 1);
+});
+
+await runFrontend({ createInvoice: true, params: new URLSearchParams() }, async ({ $, connect, window, walletMethods }) => {
+  connect();
+  window.navigate('create');
+  await waitFor(() => /No invoice events found/.test($('#invoice-sync-status').textContent));
+  $('#client-name').value = 'Test client';
+  $('#client-email').value = 'test@example.invalid';
+  $('#due-date').value = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  $('.item-description').value = 'An offline test invoice';
+  $('.item-price').value = '0.01';
+  await window.arusPayCreateInvoice();
+  assert.equal($('#transaction-dialog').dataset.phase, 'confirmed');
+  assert.equal($('[data-transaction-type]').textContent, 'Invoice creation');
+  assert.equal($('[data-transaction-amount]').textContent, '0.01 USDC');
+  assert.equal($('[data-transaction-hash]').textContent, hash);
+  assert.equal(walletMethods.filter(method => method === 'eth_sendTransaction').length, 1);
 });
 
 await runFrontend({ changeProviderAtReservation: true }, async ({ $, connect, walletMethods, actions }) => {

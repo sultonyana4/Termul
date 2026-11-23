@@ -1,14 +1,15 @@
-import { connect, createConfig, disconnect, getAccount, reconnect, watchAccount } from '@wagmi/core';
+import { connect, createConfig, disconnect, getConnection, reconnect, watchConnection } from '@wagmi/core';
 import { getAddress, http } from 'viem';
 import { arcChain, arcNetwork } from './arc-network.js';
 import { discoverInjectedWallets, injectedConnector } from './injected-wallets.js';
-import { assertWalletProvider, sameWallet, switchWalletToArc } from './wallet-provider.js';
+import { exchangeChains } from './any-token-networks.js';
+import { assertProviderChain, sameWallet, switchWalletToChain } from './wallet-provider.js';
 import { createWalletSession, endpointFor } from './wallet-session.js';
 import './wallet-ui.css';
 
-const config = createConfig({
-  chains: [arcChain],
-  transports: { [arcChain.id]: http(arcNetwork.rpcUrl) },
+export const walletConfig = createConfig({
+  chains: exchangeChains,
+  transports: Object.fromEntries(exchangeChains.map(chain => [chain.id, http(chain.rpcUrls.default.http[0])])),
   multiInjectedProviderDiscovery: false,
   storage: null,
 });
@@ -20,7 +21,7 @@ let busy = false;
 let restoredWallet;
 let revision = 0;
 
-function selection(account = getAccount(config)) {
+function selection(account = getConnection(walletConfig)) {
   return account.isConnected && account.address && account.connector
     ? { address: account.address, chainId: account.chainId, connectorId: account.connector.uid, revision }
     : null;
@@ -34,7 +35,7 @@ function savePreference(wallet, address) {
 }
 
 async function getProvider(expected) {
-  const account = getAccount(config);
+  const account = getConnection(walletConfig);
   if (!sameWallet(expected, selection(account))) throw new Error('The connected wallet changed.');
   const provider = await account.connector.getProvider();
   if (!sameWallet(expected, selection())) throw new Error('The connected wallet changed.');
@@ -89,7 +90,7 @@ async function selectWallet(wallet) {
   status.textContent = 'Approve the connection in your wallet.';
   renderChoices();
   try {
-    const { accounts } = await connect(config, { connector: injectedConnector(wallet) });
+    const { accounts } = await connect(walletConfig, { connector: injectedConnector(wallet) });
     const unique = wallet.rdns && discovery.list().filter(other => other.rdns === wallet.rdns).length === 1;
     savePreference(unique ? wallet : null, accounts[0]);
     dialog.close();
@@ -107,7 +108,7 @@ async function disconnectWallet() {
   session.invalidate();
   restoredWallet = null;
   savePreference();
-  await disconnect(config);
+  await disconnect(walletConfig);
 }
 
 const discovery = discoverInjectedWallets(window, () => {
@@ -128,26 +129,32 @@ window.termulWallet = {
   disconnect: disconnectWallet,
   getSelection: selection,
   getProvider,
-  async switchNetwork() {
-    const selected = selection();
-    const provider = await getProvider(selected);
-    const assertSameAccount = () => {
-      const current = selection();
-      if (current?.connectorId !== selected.connectorId || current.address !== selected.address) {
-        throw new Error('The connected wallet changed.');
-      }
-    };
-    await switchWalletToArc(provider, assertSameAccount);
-    await assertWalletProvider(provider, selected.address);
-    assertSameAccount();
-    // Some extensions switch successfully without emitting chainChanged.
-    getAccount(config).connector.onChainChanged('0x' + arcChain.id.toString(16));
+  switchNetwork: () => switchNetwork(arcChain),
+  switchExchangeNetwork(chain) {
+    if (!exchangeChains.includes(chain)) throw new Error('Unsupported network.');
+    return switchNetwork(chain);
   },
   session,
 };
 
+async function switchNetwork(chain) {
+  const selected = selection();
+  const provider = await getProvider(selected);
+  const assertSameAccount = () => {
+    const current = selection();
+    if (current?.connectorId !== selected.connectorId || current.address !== selected.address) {
+      throw new Error('The connected wallet changed.');
+    }
+  };
+  await switchWalletToChain(provider, chain, assertSameAccount);
+  await assertProviderChain(provider, selected.address, chain.id);
+  assertSameAccount();
+  // Some extensions switch successfully without emitting chainChanged.
+  getConnection(walletConfig).connector.onChainChanged('0x' + chain.id.toString(16));
+}
+
 let lastSelection = null;
-watchAccount(config, {
+watchConnection(walletConfig, {
   onChange(account) {
     const current = selection(account);
     if ((!current && !lastSelection) || sameWallet(current, lastSelection)) return;
@@ -175,7 +182,7 @@ setTimeout(async () => {
   if (!wallet || duplicate) return;
   busy = true;
   try {
-    const connections = await reconnect(config, { connectors: [injectedConnector(wallet, preference.address)] });
+    const connections = await reconnect(walletConfig, { connectors: [injectedConnector(wallet, preference.address)] });
     if (connections.length) {
       restoredWallet = wallet;
       if (matches().length !== 1 || !sameWallet(selection(), {

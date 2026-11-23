@@ -24,6 +24,7 @@ import {
 } from './invoice-creation.js';
 import { metadataApi } from './metadata-api.js';
 import { arcNetwork, validatePaymentLinkNetwork, verifyInvoiceDeployment } from './arc-network.js';
+import { transactionDialogFor } from './transaction-dialog.js';
 
 const { chain, name: networkName, rpcUrl: ARC_RPC, contractAddress: CONTRACT_ADDRESS,
   deploymentBlock: CONTRACT_START_BLOCK, explorerUrl: EXPLORER } = arcNetwork;
@@ -37,6 +38,8 @@ const paymentReconciliationWatchers = new Map();
 const paymentReconciliationWatchComplete = new Set();
 const runPaymentSubmissionIfIdle = createPaymentSubmissionGate();
 const runInvoiceCreationIfIdle = createPaymentSubmissionGate();
+const transactionDialog = transactionDialogFor(document.getElementById('transaction-dialog'));
+const transactionNetwork = { name: networkName, explorerName: 'Arc Explorer', explorerUrl: EXPLORER };
 let metadataSyncUnavailable = false;
 let sharedLinkError = null;
 let creationRequiresReview = false;
@@ -164,25 +167,36 @@ function showToast(message) {
   showToast.timer = setTimeout(() => toast.classList.add('hidden'), 3600);
 }
 
-function showWalletStatus(address, message = '') {
-  const badge = $('#wallet-status');
-  if (!badge) return;
-  if (address) {
-    badge.textContent = `Wallet ${shortAddress(address)}`;
-    badge.title = address;
-    badge.classList.remove('hidden');
+function transactionFeedback(type, amount, invoiceId, origin, scope) {
+  return transactionDialog.begin({
+    network: transactionNetwork, type, amount: `${formatUnits(BigInt(amount), 18)} USDC`,
+    detail: `Invoice ${shortId(invoiceId)}`, origin, scope, assets: ['USDC'],
+    successTitle: type === 'Invoice payment' ? 'Payment successful' : undefined,
+  });
+}
+
+function paymentFeedbackState(outcome, feedback, { requirePayer = true } = {}) {
+  if (outcome?.status === 'paid' && outcome.receiptStatus === 'success' && outcome.paymentTxHash) {
+    if (!requirePayer || outcome.payerMatchesExpected === true) {
+      feedback.update('confirmed', { verifiedHash: outcome.paymentTxHash,
+        message: 'This invoice was paid and confirmed on Arc.' });
+    } else {
+      feedback.update('failed', { message: 'This invoice has already been paid by another wallet.' });
+    }
+  } else if (outcome?.status === 'reverted') {
+    feedback.update('failed', { message: 'The transaction reverted. Check the current invoice status before trying again.' });
+  } else if (outcome?.status === 'not-open') {
+    feedback.update('failed', { message: 'The contract reports that this invoice is closed.' });
   } else {
-    badge.textContent = message || 'Wallet not connected';
-    badge.removeAttribute('title');
-    badge.classList.remove('hidden');
+    feedback.update('pending', { message: 'Termul could not yet verify this payment and will not send a duplicate.' });
   }
 }
 
 async function getWallet() {
-  await verifyInvoiceDeployment(publicClient, arcNetwork);
   const bridge = window.termulWallet;
   const selection = bridge?.getSelection();
   if (!selection?.address || selection.chainId !== CHAIN_ID) throw new Error('Connect your wallet on Arc Mainnet.');
+  await verifyInvoiceDeployment(publicClient, arcNetwork);
   const provider = await bridge.getProvider(selection);
   const account = getAddress(selection.address);
   const assertReadyToSign = async () => {
@@ -191,10 +205,11 @@ async function getWallet() {
     if (!bridge.session.isAuthenticated()) throw new Error('Verify wallet ownership before continuing.');
   };
   await assertWalletProvider(provider, account);
+  if (!sameWallet(selection, bridge.getSelection())) throw new Error('The connected wallet changed.');
   return { account, provider, selection, assertReadyToSign };
 }
 
-async function sendInvoiceTransaction(wallet, functionName, args, value, fee, { reserve, submitted = () => {} } = {}) {
+async function sendInvoiceTransaction(wallet, functionName, args, value, fee, { reserve, approve, submitted = () => {} } = {}) {
   const { account, provider, assertReadyToSign } = wallet;
   await verifyInvoiceDeployment(publicClient, arcNetwork);
   const nonce = await publicClient.getTransactionCount({ address: account, blockTag: 'pending' });
@@ -215,6 +230,7 @@ async function sendInvoiceTransaction(wallet, functionName, args, value, fee, { 
   if (reserve) await reserve();
   await assertReadyToSign();
   submitted(null);
+  approve?.();
   let hash;
   try {
     hash = await provider.request({ method: 'eth_sendTransaction', params: [tx] });
@@ -445,6 +461,7 @@ function startPaymentReconciliationWatch({ merchant, invoiceId, amount = null, p
       if (window.termulCurrentWalletAddress !== watchUserId) return;
       const attempt = getUncertainPaymentAttempt(merchant, invoiceId);
       if (!attempt) return;
+      paymentFeedbackState(outcome, { update: (phase, details) => transactionDialog.update(key, phase, details) });
       if (outcome.paymentTxHash && outcome.paymentTxHash !== attempt.transactionHash) {
         setUncertainPaymentAttempt(merchant, invoiceId, attempt.payer || payer, outcome.paymentTxHash, expectedAmount);
       }
@@ -708,6 +725,10 @@ async function createOnchainInvoice() {
     showToast('Check the previous creation transaction and refresh the invoice dashboard before creating another invoice.');
     return;
   }
+  if (!window.termulWallet?.session.isAuthenticated() || window.termulWallet.getSelection()?.chainId !== CHAIN_ID) {
+    window.arusPayApi?.navigate('create');
+    return;
+  }
   const form = $('#invoice-form');
   const submit = form.querySelector('[type="submit"]');
   const started = await runInvoiceCreationIfIdle(async () => {
@@ -732,10 +753,12 @@ async function createOnchainInvoice() {
       submit.textContent = message ? `Checking ${networkName}…` : originalSubmit;
       setStatus(message);
     };
+    let feedback;
     try {
       const metadata = formInvoiceMetadata();
       const expiresAt = expirationFromForm();
       const invoiceId = randomInvoiceId();
+      feedback = transactionFeedback('Invoice creation', metadata.amountBase, invoiceId, submit);
       const wallet = await getWallet();
       const { account } = wallet;
       await window.termulWallet.session.authenticate({ fresh: true });
@@ -750,7 +773,6 @@ async function createOnchainInvoice() {
         abi: invoiceAbi,
       };
       const fee = await estimateFee('createInvoice', [invoiceId, expected.amount, expiresAt], account);
-      showToast(`Review wallet confirmation. Estimated network fee: ${formatUsdc(fee.fee)} USDC; paid by your wallet.`);
       updateStatus('Waiting for wallet approval. Termul will submit this invoice only once.');
 
       const reconcile = (attempt = {}) => reconcileInvoiceCreationAttempt({
@@ -761,17 +783,19 @@ async function createOnchainInvoice() {
         readTransaction: (hash) => publicClient.getTransaction({ hash }),
       });
       const attempt = await submitInvoiceCreationOnce({
-        submit: () => sendInvoiceTransaction(wallet, 'createInvoice', [invoiceId, expected.amount, expiresAt], 0n, fee),
-        waitForReceipt: (hash) => publicClient.waitForTransactionReceipt({
-          hash,
-          timeout: 45000,
-          pollingInterval: 1500,
+        submit: () => sendInvoiceTransaction(wallet, 'createInvoice', [invoiceId, expected.amount, expiresAt], 0n, fee, {
+          approve: () => feedback.update('approval', { message: `Review invoice creation in your wallet. Estimated fee: ${formatUsdc(fee.fee)} USDC.` }),
         }),
+        waitForReceipt: (hash) => {
+          feedback.update('submitted');
+          return publicClient.waitForTransactionReceipt({ hash, timeout: 45000, pollingInterval: 1500 });
+        },
         reconcile,
       });
 
       let outcome = attempt.result;
       if (!['created', 'reverted', 'failed', 'unmatched'].includes(outcome.status)) {
+        feedback.update('pending');
         updateStatus('The wallet returned an ambiguous result. Checking the exact signed transaction and invoice event; do not retry or approve again.');
         showToast('The wallet response does not prove failure. Termul is checking this exact invoice transaction; no second transaction will be sent.');
         outcome = await pollInvoiceCreationReconciliation({
@@ -794,6 +818,7 @@ async function createOnchainInvoice() {
       if (!sameWallet(wallet.selection, window.termulWallet?.getSelection())) return;
       if (outcome.status === 'created') {
         const hash = outcome.transactionHash;
+        feedback.update('confirmed', { verifiedHash: hash, message: 'The invoice was created on Arc Mainnet. Its payment link is ready to copy.' });
         const record = {
           ...metadata,
           id: `INV-${new Date().getFullYear()}-${invoiceId.slice(2, 10).toUpperCase()}`,
@@ -835,22 +860,27 @@ async function createOnchainInvoice() {
           ? `Invoice confirmed on ${networkName}. Its payment link is ready to copy.`
           : metadataSaveError || `Invoice confirmed on ${networkName}; its payment link is ready, but details could not sync to Supabase.`);
       } else if (outcome.status === 'reverted') {
+        feedback.update('failed', { message: 'The transaction reverted. No invoice was created.' });
         setStatus(`${networkName} confirmed that this transaction reverted. No invoice was created.`);
         showToast('The transaction reverted. No invoice is recorded, and Termul did not resend it.');
       } else if (outcome.status === 'failed') {
+        feedback.update(attempt.error?.code === 4001 ? 'rejected' : 'failed', { message: attempt.error?.shortMessage || attempt.error?.message });
         setStatus('No invoice transaction was confirmed. You may review the form and decide what to do next.');
         showToast(attempt.error?.shortMessage || attempt.error?.message || 'Invoice creation was not submitted.');
       } else if (outcome.status === 'unmatched') {
+        feedback.update('pending', { message: 'The receipt could not be matched to this invoice. Check your wallet and invoice dashboard before trying again.' });
         creationRequiresReview = true;
         setStatus('The transaction could not be matched to this exact invoice. No payment link was created.');
         showToast('The receipt did not match this invoice ID, merchant, amount, and expiry. No invoice link was created.');
       } else {
+        feedback.update('pending');
         creationRequiresReview = true;
         const review = outcome.transactionHash || attempt.transactionHash;
         setStatus(`The exact transaction is still unverified. Check the invoice dashboard and wallet history before trying again.${review ? ' Transaction hash to review: ' + review : ''}`);
         showToast('The outcome is still uncertain. No second transaction was sent and no invoice was marked successful.');
       }
     } catch (error) {
+      feedback?.update(error?.code === 4001 ? 'rejected' : 'failed', { message: error?.shortMessage || error?.message });
       setStatus('Invoice creation did not complete. No success is recorded without an exact successful receipt and InvoiceCreated event.');
       showToast(error?.shortMessage || error?.message || 'Invoice creation failed. No success is recorded without a confirmed receipt.');
     } finally {
@@ -1057,6 +1087,18 @@ async function renderPayment() {
       });
       resultPanel.append(checkButton);
     }
+    if (paymentAttempt || (paymentReconciliation?.receiptStatus === 'success' && paymentReconciliation.paymentTxHash)) {
+      const details = document.createElement('button');
+      details.type = 'button';
+      details.className = 'btn btn-quiet btn-sm transaction-details-button';
+      details.textContent = 'View transaction status';
+      details.addEventListener('click', () => {
+        const feedback = transactionFeedback('Invoice payment', invoice.amount, selected.invoiceId, details,
+          paymentAttemptKey(selected.merchant, selected.invoiceId));
+        paymentFeedbackState(paymentReconciliation, feedback, { requirePayer: false });
+      });
+      resultPanel.append(details);
+    }
     const resultAnchor = paymentButton || $('.fee-note');
     if (resultPanel.childNodes.length) resultAnchor?.after(resultPanel);
     if (paymentAttempt && !paymentReconciliationWatchComplete.has(paymentAttemptKey(selected.merchant, selected.invoiceId))) {
@@ -1130,6 +1172,7 @@ async function payInvoice(merchant, invoiceId, amount) {
     }
     if (button) button.disabled = true;
     let submission;
+    let feedback;
     try {
       const wallet = await getWallet();
       const { account } = wallet;
@@ -1138,24 +1181,27 @@ async function payInvoice(merchant, invoiceId, amount) {
       if (current.status !== STATUS.open) throw new Error(`This invoice is ${statusText(current.status, current.expiresAt).toLowerCase()} and cannot be paid.`);
       if (current.expiresAt !== 0n && current.expiresAt <= BigInt(Math.floor(Date.now() / 1000))) throw new Error('This invoice has expired.');
       if (current.amount !== BigInt(amount)) throw new Error('The displayed amount no longer matches the on-chain invoice. Review the updated invoice before paying.');
+      feedback = transactionFeedback('Invoice payment', current.amount, invoiceId, button, paymentAttemptKey(merchant, invoiceId));
       await window.termulWallet.session.authenticate();
       await wallet.assertReadyToSign();
       const prior = await metadataApi.getPaymentAttempt(merchant, invoiceId);
       if (hydrateUncertainPaymentAttempt(merchant, invoiceId, prior?.attempt)) {
+        feedback.update('pending', { message: 'Termul found a previous payment attempt and is checking its result.' });
         await renderPayment();
         return;
       }
       const fee = await estimateFee('payInvoice', [getAddress(merchant), invoiceId], account, current.amount);
-      showToast(`Review wallet confirmation for ${formatUsdc(amount)} USDC plus an estimated ${formatUsdc(fee.fee)} USDC network fee.`);
       const attempt = await submitPaymentOnce({
         submit: () => sendInvoiceTransaction(wallet, 'payInvoice', [getAddress(merchant), invoiceId], current.amount, fee, {
           reserve: async () => {
             const { attemptId } = await metadataApi.reservePaymentAttempt(merchant, invoiceId);
             submission.attemptId = attemptId;
           },
+          approve: () => feedback.update('approval', { message: `Review the invoice payment in your wallet. Estimated fee: ${formatUsdc(fee.fee)} USDC.` }),
           submitted: (hash) => {
             setUncertainPaymentAttempt(merchant, invoiceId, account, hash, current.amount, submission);
             submission.started = true;
+            if (hash) feedback.update('submitted');
           },
         }),
         waitForReceipt: (hash) => publicClient.waitForTransactionReceipt({ hash, timeout: 45000, pollingInterval: 1500 }),
@@ -1175,6 +1221,11 @@ async function payInvoice(merchant, invoiceId, amount) {
         throw attempt.error || new Error('No payment was sent.');
       }
       const outcome = attempt.result;
+      if (outcome.status === 'open' && !outcome.ambiguous && !attempt.ambiguous && !isAmbiguousPaymentError(attempt.error)) {
+        feedback.update(attempt.error?.code === 4001 ? 'rejected' : 'failed', { message: 'The contract still reports Open. No payment was confirmed.' });
+      } else {
+        paymentFeedbackState(outcome, feedback);
+      }
       if (outcome.status === 'paid') {
         if (outcome.contractStatePending || (outcome.proofUnavailable && !outcome.paymentTxHash)) {
           setUncertainPaymentAttempt(merchant, invoiceId, account, outcome.paymentTxHash || attempt.transactionHash, amount);
@@ -1232,6 +1283,9 @@ async function payInvoice(merchant, invoiceId, amount) {
             : 'The result is not yet conclusive. No second payment was submitted; check wallet activity and contract status before deciding what to do.');
       }
     } catch (error) {
+      feedback?.update(submission?.started ? 'pending' : error?.code === 4001 ? 'rejected' : 'failed', {
+        message: error?.shortMessage || error?.message,
+      });
       showToast(error?.shortMessage || error?.message || 'Could not confirm this payment. Check the current invoice status.');
       await renderPayment();
     } finally {
@@ -1264,10 +1318,8 @@ function openSharedInvoice(merchant, invoiceId) {
       merchant: safeMerchant,
     });
   } catch (error) {
-    $('#signin').classList.add('hidden');
-    $('#workspace').classList.add('hidden');
-    $('#payment').classList.remove('hidden');
     sharedLinkError = error?.message || `This payment link could not be read from ${networkName}.`;
+    window.arusPayApi?.navigate('payment');
     renderPaymentUnavailable(sharedLinkError, merchant, invoiceId);
   }
 }
@@ -1286,20 +1338,11 @@ let dashboardSyncRequest = 0;
 function setWalletBalance(value, message, error = '') {
   const balance = $('#wallet-balance');
   const status = $('#wallet-balance-state');
-  const profileBalance = $('#profile-wallet-balance');
-  const profileStatus = $('#profile-wallet-balance-state');
-  const profileAddress = $('#profile-wallet-address');
   if (balance) balance.textContent = value;
   if (status) {
     status.textContent = message;
     status.title = error;
   }
-  if (profileBalance) profileBalance.textContent = value;
-  if (profileStatus) {
-    profileStatus.textContent = message;
-    profileStatus.title = error;
-  }
-  if (profileAddress) profileAddress.textContent = activeWalletAddress || 'Not connected';
 }
 
 function setInvoiceSyncStatus(message, error = '') {
@@ -1340,12 +1383,17 @@ async function recoverWalletNetwork() {
 }
 
 async function refreshArcDashboard(address = activeWalletAddress) {
-  if (!address) return;
+  if (!address || !window.termulWallet?.session.isAuthenticated() || activeWalletSelection?.chainId !== CHAIN_ID) {
+    dashboardSyncRequest++;
+    setWalletBalance('—', 'Verify your wallet to read its balance.');
+    setInvoiceSyncStatus('Verify your wallet to sync Arc invoices.');
+    return;
+  }
   const safeAddress = getAddress(address);
   activeWalletAddress = safeAddress;
   const request = ++dashboardSyncRequest;
-  const refreshButtons = [$('#refresh-chain-sync'), $('#profile-refresh-chain-sync')].filter(Boolean);
-  refreshButtons.forEach((button) => { button.disabled = true; });
+  const refreshButton = $('#refresh-chain-sync');
+  if (refreshButton) refreshButton.disabled = true;
   setWalletBalance('—', `Reading ${networkName}…`);
   setInvoiceSyncStatus(`Syncing invoice events from ${networkName}…`);
   window.arusPayApi?.setInvoiceSyncState('loading');
@@ -1358,7 +1406,7 @@ async function refreshArcDashboard(address = activeWalletAddress) {
     verifiedChain.then(() => publicClient.getBalance({ address: safeAddress })),
     verifiedChain.then(() => syncMerchantInvoices(safeAddress)),
   ]);
-  if (request !== dashboardSyncRequest) return;
+  if (request !== dashboardSyncRequest || !window.termulWallet?.session.isAuthenticated()) return;
 
   if (balanceResult.status === 'fulfilled') {
     setWalletBalance(formatUsdc(balanceResult.value), `Native USDC balance · ${networkName}`);
@@ -1382,25 +1430,23 @@ async function refreshArcDashboard(address = activeWalletAddress) {
     window.arusPayApi?.setInvoiceSyncState('error');
   }
 
-  refreshButtons.forEach((button) => { button.disabled = false; });
+  if (refreshButton) refreshButton.disabled = false;
 }
 
 window.arusPayRefreshSync = () => refreshArcDashboard();
 if (window.arusPayApi) window.arusPayApi.clearPaymentAttemptCache = clearLocalPaymentAttemptCache;
-['#refresh-chain-sync', '#profile-refresh-chain-sync'].forEach((selector) => {
-  $(selector)?.addEventListener('click', () => {
-    if (activeWalletAddress) void refreshArcDashboard(activeWalletAddress);
-  });
+$('#refresh-chain-sync')?.addEventListener('click', () => {
+  if (activeWalletAddress) void refreshArcDashboard(activeWalletAddress);
 });
 
 window.termulInvoiceWalletChanged = (selection) => {
+  if (!sameWallet(activeWalletSelection, selection)) transactionDialog.clear();
   activeWalletSelection = selection;
   activeWalletAddress = selection ? getAddress(selection.address) : null;
   dashboardSyncRequest++;
-  showWalletStatus(activeWalletAddress);
   void checkActiveWalletProvider(selection);
   if (activeWalletAddress) {
-    void refreshArcDashboard(activeWalletAddress);
+    void refreshArcDashboard();
   } else {
     window.arusPayApi?.setInvoiceSyncState('disconnected');
     setWalletBalance('—', 'Connect a wallet to read its balance.');

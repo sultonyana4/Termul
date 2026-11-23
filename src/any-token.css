@@ -1,0 +1,35 @@
+.swap-tabs { display: flex; max-width: 880px; margin: 0 auto 20px; gap: 4px; padding: 4px; border: 1px solid var(--line); background: var(--panel); border-radius: 13px; }
+.swap-tabs button { flex: 1; min-height: 44px; border: 0; border-radius: 10px; background: transparent; color: var(--muted); font-weight: 700; }
+.swap-tabs button[aria-selected="true"] { color: var(--cyan); background: var(--panel3); }
+.any-token-content { max-width: 500px; margin: 0 auto; min-width: 0; }
+#exchange-widget { width: 100%; min-width: 0; }
+#exchange-load-status:empty { display: none; }
+#exchange-networks:not([hidden]) {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: center;
+  column-gap: clamp(8px, 3vw, 18px);
+  margin-bottom: 10px;
+  padding: 9px 14px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--panel);
+  color: var(--muted);
+  font-size: .75rem;
+}
+#exchange-networks > div { min-width: 0; }
+#exchange-networks strong {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  overflow-wrap: anywhere;
+  color: var(--text);
+  font-size: .875rem;
+}
+#exchange-networks img { flex: 0 0 18px; width: 18px; height: 18px; object-fit: contain; }
+.exchange-recovery { margin: 14px 0; padding: clamp(12px, 4vw, 20px); overflow-wrap: anywhere; }
+.exchange-recovery h2 { margin: 0; font-size: 1rem; }
+.exchange-recovery .btn { min-height: 44px; }
+#exchange-check { margin-top: 10px; }
+#exchange-check-status:empty { display: none; }
+.transaction-extra:not([hidden]) { margin-top: 12px; }

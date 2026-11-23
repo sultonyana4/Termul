@@ -40,7 +40,7 @@ The browser and database persist non-authoritative recovery hints. A server rese
 
 ## Offline Chromium smoke test
 
-Run the contract build locally so the browser fixture can compare the artifact with the pinned runtime hash. Build with an isolated output directory and the fixture API URL. Use Playwright from a separate local installation. The harness intercepts the exact production origin, Arc RPC and fixture API, blocks other network traffic and uses simulated wallet responses.
+Run the contract build locally so the browser fixture can compare the artifact with the pinned runtime hash. Build with an isolated output directory and the fixture API URL. Use Playwright from a separate local installation. The harness intercepts the production origin, fixture API, LI.FI API, and Arc and Base RPCs. It blocks other traffic and simulates wallet responses.
 
 ```bash
 (cd contracts && forge build)
@@ -51,7 +51,7 @@ TERMUL_PLAYWRIGHT=/absolute/path/to/playwright/index.mjs \
   node scripts/wallet-browser.test.mjs
 ```
 
-Set `TERMUL_CHROMIUM` to use a specific installed Chromium executable. The browser fixture covers injected selection, wrong-network recovery, balance, invoice indexing, rejected signature, sessions, reconnect, account switching, disconnect and a Paid invoice link.
+Set `TERMUL_CHROMIUM` to use a specific installed Chromium executable. The browser fixture covers injected selection, wrong-network recovery, balance, invoice indexing, rejected signature, sessions, reconnect, account switching, disconnect, and a Paid invoice link. It also checks guest access to Any Token, the shared picker, six viewport widths, and receipt recovery for a simulated Arc-to-Base transfer.
 
 ## External reviewer cutover
 

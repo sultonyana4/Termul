@@ -1,0 +1,55 @@
+.swap-heading, .swap-layout { max-width: 880px; margin-inline: auto; }
+.swap-heading { align-items: center; margin-bottom: 20px; }
+.swap-layout { display: grid; grid-template-columns: minmax(0, 1.32fr) minmax(0, 1fr); gap: 18px; align-items: start; }
+.swap-panel { min-width: 0; padding: clamp(14px, 3vw, 24px); border-radius: 20px; }
+.swap-panel h2, #swap-review-title { margin: 0; }
+.swap-token-row { min-width: 0; padding: 16px; border-radius: 15px; background: var(--panel2); border: 1px solid var(--line); }
+.swap-token-row:focus-within { border-color: color-mix(in srgb, var(--cyan) 54%, var(--line)); }
+.swap-token-row > label, .swap-token-row > span { font-weight: 700; }
+.swap-amount-row, .swap-balance { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-width: 0; }
+.swap-amount-row { margin-top: 8px; }
+.swap-amount-row input, .swap-amount-row output { flex: 1; min-width: 0; font-size: clamp(24px, 4vw, 34px); font-weight: 700; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; letter-spacing: -.04em; }
+.swap-amount-row input.field { padding: 0 2px; height: 48px; border: 0; background: transparent; }
+.swap-amount-row input.field:focus-visible { outline: 2px solid var(--cyan); outline-offset: 3px; }
+.swap-amount-row output { min-height: 48px; align-content: center; }
+.swap-balance { min-height: 42px; margin-top: 6px; color: var(--muted); overflow-wrap: anywhere; }
+.swap-direction { display: grid; place-items: center; position: relative; margin: -3px auto; min-height: 44px; min-width: 44px; padding: 0 10px; border: 3px solid var(--panel); background: var(--panel3); font-size: 18px; color: var(--cyan); }
+.swap-direction:hover { background: #223445; }
+#swap-max, .swap-submit, #swap-check, #swap-review-dialog .btn { min-height: 44px; }
+#swap-max { color: var(--cyan); }
+.swap-submit { width: 100%; }
+.swap-submit:disabled { background: var(--panel3); color: #a9b4c5; opacity: 1; cursor: not-allowed; }
+[data-swap="status"] { min-height: 2.5em; margin: 12px 0 8px; overflow-wrap: anywhere; }
+[data-swap="status"][data-tone="warning"] { color: var(--amber); }
+.swap-details { margin: 8px 0 0; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 0 12px; }
+.swap-details dt, .swap-details dd { padding-block: 7px; border-bottom: 1px solid var(--line); }
+.swap-details dt { color: var(--muted); }
+.swap-details dd { font-variant-numeric: tabular-nums; text-align: right; margin: 0; overflow-wrap: anywhere; }
+.swap-details dd[data-swap="rate"] { color: var(--cyan); font-weight: 700; }
+.fee-disclosure { margin-top: 8px; color: var(--muted); overflow-wrap: anywhere; }
+.fee-disclosure summary { color: var(--text); min-height: 44px; align-content: center; cursor: pointer; }
+.swap-fee-note { margin: 8px 0 0; }
+.swap-history { border-top: 1px solid var(--line); margin-top: 16px; padding-top: 12px; }
+.swap-links { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 8px; }
+.swap-review-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+.swap-review-pair { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 10px; align-items: center; padding: 12px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel2); }
+.swap-review-pair dd { display: flex; align-items: center; justify-content: end; margin: 0; gap: 8px; overflow-wrap: anywhere; text-align: right; min-width: 0; }
+#swap-review-dialog {
+  width: min(460px, calc(100% - 24px));
+  max-height: calc(100dvh - 28px);
+  border: 1px solid var(--line);
+  border-radius: 20px;
+  color: var(--text);
+  background: var(--panel);
+}
+#swap-review-dialog::backdrop { background: rgb(8 11 19 / 78%); }
+#swap-review-dialog .transaction-actions { justify-content: end; }
+@media (max-width: 840px) {
+  .swap-heading, .swap-layout { max-width: 560px; }
+  .swap-layout { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 400px) {
+  .swap-heading p { max-width: 28ch; }
+  .swap-token-row { padding: 12px; }
+  .swap-panel { border-radius: 16px; }
+}
