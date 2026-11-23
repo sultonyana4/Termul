@@ -1,10 +1,20 @@
+import { arcNetwork } from './arc-network.js';
+
 const DEFAULT_ARUSPAY_API_URL = 'https://xudcqwfyrfsjrjxbcssy.supabase.co/functions/v1/aruspay-api';
 const configuredApiUrl = import.meta.env?.VITE_ARUSPAY_API_URL;
-const API_URL = configuredApiUrl || DEFAULT_ARUSPAY_API_URL;
+const testnetApiUrl = configuredApiUrl || DEFAULT_ARUSPAY_API_URL;
+const isMainnet = arcNetwork.chain?.testnet === false;
 const paymentAttemptWrites = new Map();
 const currentUserId = () => globalThis.window?.arusPayCurrentPrivyUserId || null;
 
 async function request(action, payload = {}, expectedUserId = currentUserId()) {
+  const invoiceAction = action !== 'get_profile' && action !== 'save_profile';
+  if (invoiceAction && arcNetwork.error) throw new Error(arcNetwork.error);
+  const deployment = invoiceAction && isMainnet
+    ? { chainId: arcNetwork.chain.id, contractAddress: arcNetwork.contractAddress }
+    : undefined;
+  const apiUrl = isMainnet ? arcNetwork.metadataUrl : testnetApiUrl;
+  if (!apiUrl) throw new Error('The Arc Mainnet metadata endpoint is unavailable.');
   if (!expectedUserId) throw new Error('Sign in with Privy to sync Termul metadata.');
   const assertSameUser = () => {
     if (currentUserId() !== expectedUserId) throw new Error('Your Privy account changed. Retry from the current account.');
@@ -25,27 +35,35 @@ async function request(action, payload = {}, expectedUserId = currentUserId()) {
     headers['X-Privy-Identity-Token'] = identityToken;
   }
 
-  const response = await fetch(API_URL, {
-    method: 'POST',
-    mode: 'cors',
-    credentials: 'omit',
-    cache: 'no-store',
-    headers,
-    body: JSON.stringify({ action, ...payload, expectedPrivyUserId: expectedUserId }),
-  });
-
-  let result = null;
-  try {
-    result = await response.json();
-  } catch {
-    // Keep backend details out of the browser error surface.
+  const post = async (body) => {
+    const response = await fetch(apiUrl, {
+      method: 'POST',
+      mode: 'cors',
+      credentials: 'omit',
+      cache: 'no-store',
+      headers,
+      body: JSON.stringify({ ...body, deployment, expectedPrivyUserId: expectedUserId }),
+    });
+    let result = null;
+    try {
+      result = await response.json();
+    } catch {
+      // Keep backend details out of the browser error surface.
+    }
+    assertSameUser();
+    if (!response.ok) {
+      if (response.status === 401) throw new Error('Your Privy session could not be verified. Sign in again and retry.');
+      throw new Error(result?.error || 'Termul cloud metadata is temporarily unavailable.');
+    }
+    return result || {};
+  };
+  if (deployment) {
+    const { deployment: approved } = await post({ action: 'get_deployment' });
+    if (approved?.chainId !== deployment.chainId || approved?.contractAddress !== deployment.contractAddress) {
+      throw new Error('The metadata server did not confirm the configured mainnet deployment.');
+    }
   }
-  assertSameUser();
-  if (!response.ok) {
-    if (response.status === 401) throw new Error('Your Privy session could not be verified. Sign in again and retry.');
-    throw new Error(result?.error || 'Termul cloud metadata is temporarily unavailable.');
-  }
-  return result || {};
+  return post({ action, ...payload });
 }
 
 function queuePaymentAttempt(action, payload) {

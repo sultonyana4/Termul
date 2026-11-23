@@ -9,7 +9,8 @@ export function isPrivyWalletClientType(walletClientType) {
 export function isExpectedHexChainId(chainId, expectedChainId) {
   return typeof chainId === 'string'
     && /^0x[0-9a-f]+$/i.test(chainId)
-    && Number.parseInt(chainId, 16) === expectedChainId;
+    && Number.isSafeInteger(expectedChainId) && expectedChainId > 0
+    && BigInt(chainId) === BigInt(expectedChainId);
 }
 
 export function withTimeout(operation, timeoutMs, message = 'The operation timed out.') {

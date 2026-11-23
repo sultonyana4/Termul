@@ -150,6 +150,7 @@ const readDeps = {
 
 {
   const wrongEvents = [
+    { label: 'removed log', log: { ...createdLog, removed: true } },
     {
       label: 'invoice ID',
       log: { ...createdLog, topics: encodeEventTopics({ abi, eventName: 'InvoiceCreated', args: { invoiceId: `0x${'cd'.repeat(32)}`, merchant } }) },

@@ -2,8 +2,9 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { createRemoteJWKSet, jwtVerify } from "https://deno.land/x/jose@v5.9.6/index.ts";
 import {
-  ARC_CHAIN_ID,
-  ARUSPAY_CONTRACT_ADDRESS,
+  configuredMainnetOrigin,
+  createMainnetMetadataDeployment,
+  resolveMetadataDeployment,
   InputError,
   PRIVY_APP_ID,
   PRIVY_ISSUER,
@@ -16,6 +17,8 @@ import {
   parseProfilePayload,
 } from "./domain.js";
 
+const mainnetDeployment = createMainnetMetadataDeployment(Deno.env.get("TERMUL_MAINNET_CONTRACT_ADDRESS"));
+const mainnetOrigin = mainnetDeployment ? configuredMainnetOrigin(Deno.env.get("TERMUL_MAINNET_ORIGIN")) : null;
 const MAX_BODY_BYTES = 16 * 1024;
 const jwks = createRemoteJWKSet(
   new URL(`https://auth.privy.io/api/v1/apps/${PRIVY_APP_ID}/jwks.json`),
@@ -29,7 +32,7 @@ function jsonResponse(body: Record<string, unknown>, status: number, origin?: st
     "Cache-Control": "no-store",
     "Vary": "Origin",
   });
-  if (origin && isAllowedOrigin(origin)) {
+  if (origin && isAllowedOrigin(origin, mainnetOrigin)) {
     headers.set("Access-Control-Allow-Origin", origin);
     headers.set("Access-Control-Allow-Methods", "POST, OPTIONS");
     headers.set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Privy-Identity-Token");
@@ -55,9 +58,29 @@ async function parseBody(request: Request): Promise<Record<string, unknown> | nu
   const contentType = request.headers.get("Content-Type") ?? "";
   if (!/^application\/json(?:\s*;|\s*$)/i.test(contentType)) return null;
   const declaredLength = Number(request.headers.get("Content-Length") ?? "0");
-  if (Number.isFinite(declaredLength) && declaredLength > MAX_BODY_BYTES) return null;
-  const raw = await request.text();
-  if (new TextEncoder().encode(raw).byteLength > MAX_BODY_BYTES) return null;
+  const oversized = () => new InputError("Request body exceeds the size limit.", 413);
+  if (declaredLength > MAX_BODY_BYTES) throw oversized();
+  if (!request.body) return null;
+
+  const reader = request.body.getReader();
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  let bytes = 0;
+  let raw = "";
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      bytes += value.byteLength;
+      if (bytes > MAX_BODY_BYTES) throw oversized();
+      raw += decoder.decode(value, { stream: true });
+    }
+    raw += decoder.decode();
+  } catch (error) {
+    void reader.cancel().catch(() => {});
+    throw error;
+  } finally {
+    reader.releaseLock();
+  }
   const value: unknown = JSON.parse(raw);
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   return value as Record<string, unknown>;
@@ -71,7 +94,9 @@ async function authenticate(request: Request): Promise<string | null> {
       issuer: PRIVY_ISSUER,
       audience: PRIVY_APP_ID,
       algorithms: ["ES256"],
+      requiredClaims: ["sub", "exp", "iat", "sid"],
     });
+    if (typeof payload.sid !== "string" || !payload.sid) return null;
     if (typeof payload.sub !== "string" || !payload.sub.startsWith("did:privy:")) return null;
     return payload.sub;
   } catch {
@@ -87,6 +112,7 @@ async function verifyInvoiceWalletIdentity(request: Request, privyUserId: string
       issuer: PRIVY_ISSUER,
       audience: PRIVY_APP_ID,
       algorithms: ["ES256"],
+      requiredClaims: ["sub", "exp", "iat"],
     });
     return identityTokenHasWallet(payload, privyUserId, merchantAddress);
   } catch {
@@ -96,7 +122,7 @@ async function verifyInvoiceWalletIdentity(request: Request, privyUserId: string
 
 Deno.serve(async (request: Request) => {
   const origin = request.headers.get("Origin") ?? undefined;
-  if (origin && !isAllowedOrigin(origin)) return errorResponse(403);
+  if (origin && !isAllowedOrigin(origin, mainnetOrigin)) return errorResponse(403);
 
   if (request.method === "OPTIONS") {
     if (!origin) return new Response(null, { status: 204 });
@@ -119,8 +145,8 @@ Deno.serve(async (request: Request) => {
   let payload: Record<string, unknown> | null;
   try {
     payload = await parseBody(request);
-  } catch {
-    return errorResponse(400, origin);
+  } catch (error) {
+    return errorResponse(error instanceof InputError ? error.status : 400, origin);
   }
   if (!payload) return errorResponse(415, origin);
   // This value is only a race guard; the signed token remains the identity authority.
@@ -128,12 +154,16 @@ Deno.serve(async (request: Request) => {
 
   const action = payload.action;
   const supportedActions = [
-    "get_profile", "save_profile", "get_invoices", "save_invoice",
+    "get_profile", "save_profile", "get_deployment", "get_invoices", "save_invoice",
     "get_payment_attempt", "save_payment_attempt", "clear_payment_attempt",
   ];
   if (typeof action !== "string" || !supportedActions.includes(action)) return errorResponse(400, origin);
 
   try {
+    const deployment = resolveMetadataDeployment(payload, mainnetDeployment);
+    if (action === "get_deployment") {
+      return jsonResponse({ deployment: { chainId: deployment.chainId, contractAddress: deployment.contractAddress } }, 200, origin);
+    }
     const supabase = getSupabase();
 
     if (action === "get_profile") {
@@ -176,11 +206,11 @@ Deno.serve(async (request: Request) => {
         return errorResponse(403, origin);
       }
       const { data, error } = await supabase
-        .from("merchant_invoices")
+        .from(deployment.invoicesTable)
         .select(INVOICE_METADATA_COLUMNS)
         .eq("merchant_privy_user_id", authorizationSubject)
-        .eq("chain_id", ARC_CHAIN_ID)
-        .eq("contract_address", ARUSPAY_CONTRACT_ADDRESS)
+        .eq("chain_id", deployment.chainId)
+        .eq("contract_address", deployment.contractAddress)
         .eq("merchant_address", merchantAddress)
         .order("created_at", { ascending: false })
         .limit(200);
@@ -191,7 +221,7 @@ Deno.serve(async (request: Request) => {
     if (action === "save_invoice") {
       let invoice: ReturnType<typeof parseInvoicePayload>;
       try {
-        invoice = parseInvoicePayload(payload, authorizationSubject);
+        invoice = parseInvoicePayload(payload, authorizationSubject, deployment);
       } catch (error) {
         return errorResponse(error instanceof InputError ? error.status : 400, origin);
       }
@@ -199,7 +229,7 @@ Deno.serve(async (request: Request) => {
         return errorResponse(403, origin);
       }
       const { data, error } = await supabase
-        .from("merchant_invoices")
+        .from(deployment.invoicesTable)
         .upsert(invoice, {
           onConflict: "chain_id,contract_address,merchant_address,invoice_id",
           ignoreDuplicates: true,
@@ -210,11 +240,11 @@ Deno.serve(async (request: Request) => {
       if (data) return jsonResponse({ invoice: data }, 200, origin);
 
       const { data: existing, error: lookupError } = await supabase
-        .from("merchant_invoices")
+        .from(deployment.invoicesTable)
         .select(INVOICE_METADATA_COLUMNS)
         .eq("merchant_privy_user_id", authorizationSubject)
-        .eq("chain_id", ARC_CHAIN_ID)
-        .eq("contract_address", ARUSPAY_CONTRACT_ADDRESS)
+        .eq("chain_id", deployment.chainId)
+        .eq("contract_address", deployment.contractAddress)
         .eq("merchant_address", invoice.merchant_address)
         .eq("invoice_id", invoice.invoice_id)
         .maybeSingle();
@@ -231,10 +261,10 @@ Deno.serve(async (request: Request) => {
         return errorResponse(error instanceof InputError ? error.status : 400, origin);
       }
       const { data, error } = await supabase
-        .from("payment_attempts")
+        .from(deployment.attemptsTable)
         .select(PAYMENT_ATTEMPT_COLUMNS)
-        .eq("chain_id", ARC_CHAIN_ID)
-        .eq("contract_address", ARUSPAY_CONTRACT_ADDRESS)
+        .eq("chain_id", deployment.chainId)
+        .eq("contract_address", deployment.contractAddress)
         .eq("merchant_address", key.merchant_address)
         .eq("invoice_id", key.invoice_id)
         .eq("payer_privy_user_id", authorizationSubject)
@@ -246,12 +276,12 @@ Deno.serve(async (request: Request) => {
     if (action === "save_payment_attempt") {
       let attempt: ReturnType<typeof parsePaymentAttemptPayload>;
       try {
-        attempt = parsePaymentAttemptPayload(payload, authorizationSubject);
+        attempt = parsePaymentAttemptPayload(payload, authorizationSubject, deployment);
       } catch (error) {
         return errorResponse(error instanceof InputError ? error.status : 400, origin);
       }
       const { data, error } = await supabase
-        .from("payment_attempts")
+        .from(deployment.attemptsTable)
         .upsert(attempt, {
           onConflict: "chain_id,contract_address,merchant_address,invoice_id,payer_privy_user_id",
         })
@@ -269,10 +299,10 @@ Deno.serve(async (request: Request) => {
         return errorResponse(error instanceof InputError ? error.status : 400, origin);
       }
       const { error } = await supabase
-        .from("payment_attempts")
+        .from(deployment.attemptsTable)
         .delete()
-        .eq("chain_id", ARC_CHAIN_ID)
-        .eq("contract_address", ARUSPAY_CONTRACT_ADDRESS)
+        .eq("chain_id", deployment.chainId)
+        .eq("contract_address", deployment.contractAddress)
         .eq("merchant_address", key.merchant_address)
         .eq("invoice_id", key.invoice_id)
         .eq("payer_privy_user_id", authorizationSubject);
@@ -281,7 +311,7 @@ Deno.serve(async (request: Request) => {
     }
 
     return errorResponse(400, origin);
-  } catch {
-    return errorResponse(500, origin);
+  } catch (error) {
+    return errorResponse(error instanceof InputError ? error.status : 500, origin);
   }
 });

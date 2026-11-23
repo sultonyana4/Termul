@@ -1,5 +1,6 @@
 import { readFile } from 'node:fs/promises';
 import assert from 'node:assert/strict';
+import { resolveArcNetwork } from '../src/arc-network.js';
 import { JSDOM } from 'jsdom';
 import { isExpectedHexChainId, selectWalletsForOnchainSync, waitForConnectedEthereumProvider, withTimeout } from '../src/privy-wallets.js';
 
@@ -10,7 +11,7 @@ const sharedInvoiceSource = arcSyncSource.match(/function openSharedInvoice\([\s
 assert.ok(sharedInvoiceSource, 'A direct payment-link hydration function must exist.');
 assert.match(sharedInvoiceSource, /window\.arusPayApi\?\.openInvoice/, 'A valid payment link must select the invoice before asynchronous contract reads.');
 assert.doesNotMatch(sharedInvoiceSource, /await\s+getOnchainInvoice/, 'Payment-link selection must not wait for the chain before rendering the loading state.');
-assert.match(arcSyncSource, /requestId !== paymentRenderRequest/, 'Late RPC results must not overwrite a newer payment view.');
+assert.match(arcSyncSource, /requestId === paymentRenderRequest && renderUserId === window.arusPayCurrentPrivyUserId/, 'Late RPC results must not overwrite a newer payment view.');
 assert.match(arcSyncSource, /Connect wallet to pay/, 'An invoice must show a wallet connection action without hiding its on-chain details.');
 assert.match(arcSyncSource, /The read-only wallet provider check did not pass/, 'A linked wallet without a verified provider must not be treated as ready.');
 assert.match(arcSyncSource, /getRuntimeDiagnostics/, 'A failed wallet check must expose a safe runtime snapshot.');
@@ -19,12 +20,12 @@ assert.match(privyAuthSource, /ready: walletsAreReady/, 'Provider lookup must wa
 assert.match(privyAuthSource, /waitForConnectedEthereumProvider/, 'Provider lookup must use the readiness-aware wallet helper.');
 assert.match(arcSyncSource, /withTimeout\([\s\S]*?method: 'eth_chainId'/, 'The actual read-only chain probe must have a deadline.');
 assert.match(arcSyncSource, /within 12 seconds[\s\S]*No signature or transaction was requested/, 'Timeouts must explain the read-only failure without implying a transaction.');
-assert.match(arcSyncSource, /isExpectedHexChainId\(chainId, ARC_TESTNET_ID\)/, 'A provider is not ready unless it proves the Arc Testnet chain ID.');
+assert.match(arcSyncSource, /isExpectedHexChainId\(chainId, CHAIN_ID\)/, 'A provider is ready only after proving the configured Arc chain ID.');
 assert.match(arcSyncSource, /if \(activeWalletAddress && !providerVerified\) \{\s*paymentButton\.disabled = true;/, 'Pay remains disabled until the wallet network check succeeds.');
 assert.match(arcSyncSource, /if \(activeWalletAddress && \(activeWalletProviderState !== 'connected' \|\| !activeWalletProviderReady\)\) return;/, 'The click handler independently blocks payment without a verified provider.');
 assert.match(arcSyncSource, /Copy safe diagnostics/, 'A failed check must offer one practical way to share only safe runtime state.');
 assert.doesNotMatch(arcSyncSource, /Retry Privy connection|Retry wallet connection/, 'The payment page must not encourage repeated blind retries.');
-assert.match(arcSyncSource, /wallets\.find\(isEvmConnectedWallet\)/, 'Wallet selection must accept the SDK 3.51.3 `type: ethereum` shape.');
+assert.match(arcSyncSource, /wallets\.find\(isEvmConnectedWallet\)/, 'Wallet selection must accept the SDK 3.52.0 `type: ethereum` shape.');
 assert.doesNotMatch(privyAuthSource, /Date\.now\(\) \+ 2000/, 'A fixed two-second wallet restoration window must not return early.');
 assert.ok(arcSyncSource.includes('paymentButton.disabled = true;'), 'Payment stays disabled until the Privy provider passes a read-only check.');
 assert.ok(arcSyncSource.includes("method: 'eth_chainId'"), 'The connection probe must be read-only.');
@@ -204,10 +205,11 @@ assert.match(balanceSetter, /#profile-wallet-address/);
 assert.match(arcSyncSource, /publicClient\.getBalance\(\{\s*address:\s*safeAddress\s*\}\)/);
 assert.match(arcSyncSource, /setInvoiceSyncState\('loading'\)/);
 assert.match(arcSyncSource, /setInvoiceSyncState\('error'\)/);
-assert.match(arcSyncSource, /const ARC_TESTNET_ID = 5042002/);
-assert.match(arcSyncSource, /const CONTRACT_ADDRESS = getAddress\('0x0cc3b91Fc603Ef15d80B3C0e8DB222e5988b8926'\)/);
-assert.match(arcSyncSource, /functionName: 'createInvoice'/);
-assert.match(arcSyncSource, /functionName: 'payInvoice'/);
+const defaultNetwork = resolveArcNetwork();
+assert.equal(defaultNetwork.chain.id, 5042002);
+assert.equal(defaultNetwork.contractAddress, '0x0cc3b91fc603ef15d80b3c0e8db222e5988b8926');
+assert.match(arcSyncSource, /sendInvoiceTransaction\(wallet, 'createInvoice'/);
+assert.match(arcSyncSource, /sendInvoiceTransaction\(wallet, 'payInvoice'/);
 assert.match(arcSyncSource, /submitInvoiceCreationOnce\(/);
 assert.match(arcSyncSource, /broadcastSignedTransactionOnce\(/);
 assert.match(arcSyncSource, /pollInvoiceCreationReconciliation\(/);

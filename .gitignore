@@ -15,5 +15,8 @@ contracts/cache/
 contracts/out/
 contracts/broadcast/
 
+# Supabase CLI local state
+supabase/.temp/
+
 # Test output
 coverage/

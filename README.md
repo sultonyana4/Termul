@@ -1,6 +1,6 @@
 # Termul — Arc Testnet Invoice App
 
-A responsive invoice workflow connected to the deployed `ArusPayInvoices` contract on Arc Testnet. The application is intentionally testnet-only; it does not configure Arc Mainnet.
+A responsive invoice workflow connected to the deployed `ArusPayInvoices` contract on Arc Testnet. The default build uses Arc Testnet. Mainnet preparation and owner activation steps are in the [readiness checklist](docs/MAINNET_READINESS.md) and [deployment runbook](docs/MAINNET_DEPLOYMENT.md).
 
 ## Arc Testnet configuration
 
@@ -11,7 +11,7 @@ A responsive invoice workflow connected to the deployed `ArusPayInvoices` contra
 - Deployed invoice contract: `0x0cc3b91Fc603Ef15d80B3C0e8DB222e5988b8926`
 - Native gas and payment asset: USDC with 18 decimal places
 
-Privy is configured with Arc Testnet as its default and only supported EVM chain in this application. The invoice module also checks the connected provider's chain ID before signing and will only add or switch to Arc Testnet.
+In the default build, Privy supports Arc Testnet and the invoice module verifies that chain before signing. Mainnet requires separate reviewed build configuration.
 
 ## Run locally
 
@@ -41,7 +41,7 @@ Set `VITE_PRIVY_APP_ID` in a local `.env` file to override the public Privy app 
 - Browser requests default to Arc's documented Blockdaemon Testnet endpoint because the primary Testnet RPC blocks browser CORS requests, including from the existing production domain; `VITE_ARUSPAY_BROWSER_RPC_URL` can override this transport without changing the chain or contract.
 - The dashboard reads the connected Privy wallet's native USDC balance with `eth_getBalance` (18 decimals), and syncs the wallet's invoice events from the contract deployment block in ranges below Arc's 10,000-block `eth_getLogs` limit. It then reads each invoice's current contract state. Refreshing is read-only and submits no transaction.
 - `Total received` and `Confirmed payments` include only invoices whose current contract state is `Paid` and whose matching `InvoicePaid` event has the exact amount and merchant. A faucet balance appears only under `Wallet balance`; it is not revenue.
-- A payment link contains only the merchant address and invoice ID. Invoice recipient name, email, description, and due date are off-chain metadata stored in Supabase after the app verifies the successful `InvoiceCreated` receipt and event.
+- A new payment link contains the merchant address, invoice ID, chain ID, and contract address. Existing links with only the merchant and invoice ID continue to resolve on testnet. Invoice recipient name, email, description, and due date are off-chain metadata stored in Supabase after the app verifies the successful `InvoiceCreated` receipt and event.
 - `payInvoice(address,bytes32)` submits the exact invoice value as native USDC. For Privy embedded wallets, Privy signs the prepared transaction after the user approves it; Termul computes its transaction hash locally and broadcasts the signed bytes once to the configured Arc RPC. This preserves a hash even if the RPC returns an ambiguous `already known` or `nonce too low` response, so Termul can reconcile the exact receipt and contract event instead of leaving the wallet's retry flow as the only recovery. Payment is confirmed from the deployed invoice contract state or a successful receipt with the exact matching `InvoicePaid` event and `payInvoice` transaction. If that proof is available while an RPC still reports `Open`, the UI shows `Paid`, locks further payment, explains that the state read is catching up, and continues read-only checks until the state converges. Termul never automatically resubmits a payment.
 - The connected wallet pays its own Arc Testnet USDC gas fees. No gas sponsorship, relayer, or token approval is used.
 - Payment status is read from Arc Testnet; Supabase metadata, a wallet prompt, and an unverified reported transaction hash are never treated as proof of payment.
@@ -66,7 +66,7 @@ Set `VITE_PRIVY_APP_ID` in a local `.env` file to override the public Privy app 
 
 Run the profile and metadata regressions with `npm run test:profile` and `npm run test:metadata`. They use isolated JSDOM fixtures and mocked Privy/Supabase calls to check cloud-backed display names, production-only CORS, input validation, access-token forwarding, signed wallet binding, user isolation, and the absence of app-owned local persistence. They do not authenticate a real user, test signing, reveal a private key, or send transactions. Live Privy connection, identity-token availability, X authorization, and the Privy export modal should be verified from the account owner's own signed-in session.
 
-The application must remain testnet-only until a separate, explicit mainnet launch decision and production review.
+Keep production on its current testnet build until the owner authorizes the cutover described in the readiness checklist.
 
 ## Real Arc Testnet integration test
 

@@ -128,7 +128,7 @@ const edgeFunction = await readFile(new URL('../supabase/functions/aruspay-api/i
 assert.match(edgeFunction, /jwtVerify\(match\[1\], jwks,\s*\{[\s\S]*issuer: PRIVY_ISSUER,[\s\S]*audience: PRIVY_APP_ID,[\s\S]*algorithms: \["ES256"\]/);
 assert.match(edgeFunction, /payload\.sub\.startsWith\("did:privy:"\)/);
 assert.match(edgeFunction, /SUPABASE_SERVICE_ROLE_KEY/);
-assert.match(edgeFunction, /payment_attempts/);
+assert.match(edgeFunction, /deployment.attemptsTable/);
 assert.match(edgeFunction, /verifyInvoiceWalletIdentity/);
 assert.match(edgeFunction, /X-Privy-Identity-Token/);
 assert.doesNotMatch(edgeFunction, /\.select\([^)]*status|paid_at|payment_status/i);

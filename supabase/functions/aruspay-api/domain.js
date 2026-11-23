@@ -1,7 +1,10 @@
+import { ARC_MAINNET, ARC_TESTNET, validateMainnetAddress } from '../_shared/arc-networks.js';
+
 export const PRIVY_APP_ID = 'cmw96cg3m00c30hl5gg2jvnxa';
 export const PRIVY_ISSUER = 'privy.io';
-export const ARC_CHAIN_ID = 5042002;
-export const ARUSPAY_CONTRACT_ADDRESS = '0x0cc3b91fc603ef15d80b3c0e8db222e5988b8926';
+export const ARC_CHAIN_ID = ARC_TESTNET.id;
+export const ARUSPAY_CONTRACT_ADDRESS = ARC_TESTNET.contractAddress;
+const MAX_UINT256 = (1n << 256n) - 1n;
 export const PRODUCTION_ORIGIN = 'https://aruspay-pi.vercel.app';
 export const PRODUCTION_ORIGINS = new Set(['https://termul.xyz', 'https://termul-pay.vercel.app', PRODUCTION_ORIGIN]);
 
@@ -10,15 +13,55 @@ const HASH_RE = /^0x[0-9a-fA-F]{64}$/;
 const INVOICE_ID_RE = /^0x[0-9a-fA-F]{64}$/;
 
 export class InputError extends Error {
-  constructor(message) {
+  constructor(message, status = 400) {
     super(message);
     this.name = 'InputError';
-    this.status = 400;
+    this.status = status;
   }
 }
 
-export function isAllowedOrigin(origin) {
-  return PRODUCTION_ORIGINS.has(origin);
+const testnetDeployment = Object.freeze({
+  chainId: ARC_CHAIN_ID,
+  contractAddress: ARUSPAY_CONTRACT_ADDRESS,
+  invoicesTable: 'merchant_invoices',
+  attemptsTable: 'payment_attempts',
+});
+
+export function createMainnetMetadataDeployment(contractAddress) {
+  try {
+    return Object.freeze({
+      chainId: ARC_MAINNET.id,
+      contractAddress: validateMainnetAddress(contractAddress),
+      invoicesTable: 'termul_mainnet_invoices',
+      attemptsTable: 'termul_mainnet_payment_attempts',
+    });
+  } catch {
+    return null;
+  }
+}
+
+export function resolveMetadataDeployment(payload, mainnet = null) {
+  const scope = payload?.deployment;
+  if (scope === undefined) return testnetDeployment; // Legacy testnet client.
+  if (typeof scope?.contractAddress === 'string') {
+    const contractAddress = scope.contractAddress.toLowerCase();
+    if (scope.chainId === testnetDeployment.chainId && contractAddress === testnetDeployment.contractAddress) return testnetDeployment;
+    if (mainnet && scope.chainId === mainnet.chainId && contractAddress === mainnet.contractAddress) return mainnet;
+  }
+  throw new InputError('Unsupported invoice deployment.');
+}
+
+export function configuredMainnetOrigin(value) {
+  try {
+    const url = new URL(value);
+    return url.protocol === 'https:' && url.origin === value ? url.origin : null;
+  } catch {
+    return null;
+  }
+}
+
+export function isAllowedOrigin(origin, mainnetOrigin = null) {
+  return PRODUCTION_ORIGINS.has(origin) || (mainnetOrigin !== null && origin === mainnetOrigin);
 }
 
 function requiredText(value, field, maxLength) {
@@ -55,23 +98,23 @@ export function parseProfilePayload(payload) {
   return { display_name: displayName };
 }
 
-export function parseInvoicePayload(payload, privyUserId) {
+export function parseInvoicePayload(payload, privyUserId, deployment = testnetDeployment) {
   const invoice = payload?.invoice;
   if (!invoice || typeof invoice !== 'object' || Array.isArray(invoice)) throw new InputError('Invalid invoice metadata.');
-  if (Number(invoice.chainId) !== ARC_CHAIN_ID) throw new InputError('Unsupported chain.');
+  if (invoice.chainId !== deployment.chainId) throw new InputError('Unsupported chain.');
   if (typeof invoice.contractAddress !== 'string'
-    || invoice.contractAddress.toLowerCase() !== ARUSPAY_CONTRACT_ADDRESS) {
+    || invoice.contractAddress.toLowerCase() !== deployment.contractAddress) {
     throw new InputError('Unsupported invoice contract.');
   }
 
   const amount = invoice.amountNative;
-  if (typeof amount !== 'string' || !/^\d{1,78}$/.test(amount) || BigInt(amount) <= 0n) {
+  if (typeof amount !== 'string' || !/^\d{1,78}$/.test(amount) || BigInt(amount) <= 0n || BigInt(amount) > MAX_UINT256) {
     throw new InputError('Invalid invoice amount.');
   }
   const expiresAtSeconds = invoice.expiresAt === null || invoice.expiresAt === undefined
     ? 0n
-    : BigInt(requiredText(String(invoice.expiresAt), 'invoice expiry', 16));
-  if (expiresAtSeconds < 0n || expiresAtSeconds > 253402300799n) throw new InputError('Invalid invoice expiry.');
+    : requiredText(String(invoice.expiresAt), 'invoice expiry', 16);
+  if (!/^\d+$/.test(String(expiresAtSeconds)) || BigInt(expiresAtSeconds) > 253402300799n) throw new InputError('Invalid invoice expiry.');
 
   const clientName = optionalText(invoice.clientName, 'client name', 120);
   const clientEmail = optionalText(invoice.clientEmail, 'client email', 254);
@@ -79,8 +122,8 @@ export function parseInvoicePayload(payload, privyUserId) {
   const description = optionalText(invoice.description, 'description', 1000);
 
   return {
-    chain_id: ARC_CHAIN_ID,
-    contract_address: ARUSPAY_CONTRACT_ADDRESS,
+    chain_id: deployment.chainId,
+    contract_address: deployment.contractAddress,
     merchant_privy_user_id: privyUserId,
     merchant_address: address(invoice.merchantAddress, 'merchant address'),
     invoice_id: invoiceId(invoice.invoiceId),
@@ -88,16 +131,16 @@ export function parseInvoicePayload(payload, privyUserId) {
     client_name: clientName,
     client_email: clientEmail,
     description,
-    expires_at: expiresAtSeconds === 0n ? null : new Date(Number(expiresAtSeconds) * 1000).toISOString(),
+    expires_at: BigInt(expiresAtSeconds) === 0n ? null : new Date(Number(expiresAtSeconds) * 1000).toISOString(),
     create_tx_hash: transactionHash(invoice.createTxHash, 'creation transaction hash'),
   };
 }
 
-export function parsePaymentAttemptPayload(payload, privyUserId) {
+export function parsePaymentAttemptPayload(payload, privyUserId, deployment = testnetDeployment) {
   if (!payload || typeof payload !== 'object') throw new InputError('Invalid payment attempt.');
   return {
-    chain_id: ARC_CHAIN_ID,
-    contract_address: ARUSPAY_CONTRACT_ADDRESS,
+    chain_id: deployment.chainId,
+    contract_address: deployment.contractAddress,
     merchant_address: address(payload.merchantAddress, 'merchant address'),
     invoice_id: invoiceId(payload.invoiceId),
     payer_privy_user_id: privyUserId,

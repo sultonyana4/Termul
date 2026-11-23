@@ -9,11 +9,11 @@ import {
 import { selectWalletsForOnchainSync, waitForConnectedEthereumProvider } from '../src/privy-wallets.js';
 
 const installedPrivy = JSON.parse(await readFile(new URL('../node_modules/@privy-io/react-auth/package.json', import.meta.url), 'utf8'));
-assert.equal(installedPrivy.version, '3.51.3', 'These regression fixtures target the installed Privy React Auth 3.51.3 SDK.');
+assert.equal(installedPrivy.version, '3.52.0', 'These regression fixtures target the installed Privy React Auth 3.52.0 SDK.');
 const diagnosticsSource = await readFile(new URL('../src/privy-diagnostics.js', import.meta.url), 'utf8');
 assert.doesNotMatch(diagnosticsSource, /\bfetch\b|sendBeacon|XMLHttpRequest/, 'Runtime diagnostics stay local and send no telemetry.');
 
-// In Privy 3.51.3, ConnectedWallet is an Ethereum wallet with `type: 'ethereum'`,
+// In Privy 3.52.0, ConnectedWallet is an Ethereum wallet with `type: 'ethereum'`,
 // `walletClientType`, `address`, and `getEthereumProvider()`; it need not expose `chainType`.
 const embeddedAddress = '0x1234567890abcdef1234567890abcdef12345678';
 const externalAddress = '0xabcdefabcdefabcdefabcdefabcdefabcdefabcd';

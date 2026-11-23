@@ -1,19 +1,9 @@
 import React, { useEffect, useRef } from 'react';
 import { createRoot } from 'react-dom/client';
 import { PrivyProvider, getIdentityToken, useExportWallet, useLinkAccount, useLogin, usePrivy, useWallets } from '@privy-io/react-auth';
-import { defineChain } from 'viem';
+import { arcNetwork } from './arc-network.js';
 import { selectWalletsForOnchainSync, waitForConnectedEthereumProvider } from './privy-wallets.js';
 import { createSafeWalletDiagnostics } from './privy-diagnostics.js';
-
-const ARC_RPC = import.meta.env.VITE_ARUSPAY_BROWSER_RPC_URL || 'https://rpc.blockdaemon.testnet.arc.io';
-const arcTestnet = defineChain({
-  id: 5042002,
-  name: 'Arc Testnet',
-  nativeCurrency: { name: 'USDC', symbol: 'USDC', decimals: 18 },
-  rpcUrls: { default: { http: [ARC_RPC] } },
-  blockExplorers: { default: { name: 'Arc Testnet Explorer', url: 'https://explorer.testnet.arc.io' } },
-  testnet: true,
-});
 
 const appId = import.meta.env.VITE_PRIVY_APP_ID || 'cmw96cg3m00c30hl5gg2jvnxa';
 
@@ -125,7 +115,7 @@ function PrivyBridge() {
         isReady: () => walletsReadyRef.current,
         address,
         walletClientType,
-        fallbackProvider: window.ethereum,
+        fallbackProvider: arcNetwork.chain?.testnet ? window.ethereum : undefined,
         onProviderState,
       }),
       getRuntimeDiagnostics: ({ selectedWalletClientType, providerLookupState, chainId } = {}) => createSafeWalletDiagnostics({
@@ -167,8 +157,7 @@ function PrivyRoot() {
           theme: 'dark',
           accentColor: '#65e4d0',
         },
-        defaultChain: arcTestnet,
-        supportedChains: [arcTestnet],
+        ...(arcNetwork.chain && { defaultChain: arcNetwork.chain, supportedChains: [arcNetwork.chain] }),
         embeddedWallets: {
           ethereum: { createOnLogin: 'users-without-wallets' },
         },

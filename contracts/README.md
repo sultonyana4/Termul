@@ -7,7 +7,7 @@
 - Contract: `0x0cc3b91Fc603Ef15d80B3C0e8DB222e5988b8926`
 - Explorer: `https://explorer.testnet.arc.io`
 
-This project is testnet-only. It does not configure or authorize an Arc Mainnet deployment, and this source has not been independently security-audited.
+The current testnet deployment uses the original source. The separate Mainnet contract and its owner-run verification procedure are documented in the [TermulInvoices deployment runbook](../docs/MAINNET_DEPLOYMENT.md). The contract source has received a local security review.
 
 ## Payment flow
 
@@ -37,7 +37,7 @@ forge test
 
 Foundry build output under `out/` and `cache/` is generated locally and is ignored by Git. The root README documents an optional Arc Testnet end-to-end harness; it requires an encrypted testnet keystore and sends real testnet transactions. Never store its keystore or password file in the repository. Do not run that harness unless you deliberately intend to make those testnet transactions.
 
-For Arc-specific validation, use Arc Foundry's network option as described in the [official Arc deployment guide](https://docs.arc.network/arc/tutorials/deploy-on-arc). Testnet-only operation is intended here; no mainnet deployment is configured.
+For Arc-specific validation, use Arc Foundry's network option as described in the [official Arc deployment guide](https://docs.arc.network/arc/tutorials/deploy-on-arc). The default application build uses the existing testnet deployment. The Mainnet contract address remains unset pending owner deployment.
 
 ## Sources
 

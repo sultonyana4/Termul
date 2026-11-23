@@ -3,12 +3,15 @@ import {
   createWalletClient,
   custom,
   decodeEventLog,
-  defineChain,
   encodeFunctionData,
   formatUnits,
   getAddress,
   http,
+  keccak256,
   parseUnits,
+  parseTransaction,
+  numberToHex,
+  recoverTransactionAddress,
 } from 'viem';
 import { isExpectedHexChainId, withTimeout } from './privy-wallets.js';
 import './wallet-diagnostics.css';
@@ -33,15 +36,14 @@ import {
   submitInvoiceCreationOnce,
 } from './invoice-creation.js';
 import { metadataApi } from './metadata-api.js';
+import { arcNetwork, validatePaymentLinkNetwork, verifyInvoiceDeployment } from './arc-network.js';
 
-const ARC_TESTNET_ID = 5042002;
-const ARC_ENV = import.meta.env || {};
-const ARC_RPC = ARC_ENV.VITE_ARUSPAY_BROWSER_RPC_URL || 'https://rpc.blockdaemon.testnet.arc.io';
-const CONTRACT_ADDRESS = getAddress('0x0cc3b91Fc603Ef15d80B3C0e8DB222e5988b8926');
-// The contract was deployed at block 71546111; Arc limits eth_getLogs ranges to 10,000 blocks.
-const CONTRACT_START_BLOCK = BigInt(ARC_ENV.VITE_ARUSPAY_DEPLOYMENT_BLOCK || '71546111');
+const { chain, name: networkName, rpcUrl: ARC_RPC, contractAddress: CONTRACT_ADDRESS,
+  deploymentBlock: CONTRACT_START_BLOCK, explorerUrl: EXPLORER } = arcNetwork;
+const CHAIN_ID = chain?.id;
 const LOG_BLOCK_RANGE = 9999n;
-const EXPLORER = 'https://explorer.testnet.arc.io';
+const MAX_UINT256 = (1n << 256n) - 1n;
+const MAX_FORMATTED_TIMESTAMP = 253402300799n;
 const STATUS = { none: 0, open: 1, paid: 2, cancelled: 3 };
 const uncertainPaymentAttempts = new Map();
 const paymentReconciliationWatchers = new Map();
@@ -49,15 +51,8 @@ const paymentReconciliationWatchComplete = new Set();
 const runPaymentSubmissionIfIdle = createPaymentSubmissionGate();
 const runInvoiceCreationIfIdle = createPaymentSubmissionGate();
 let metadataSyncUnavailable = false;
-
-const arcTestnet = defineChain({
-  id: ARC_TESTNET_ID,
-  name: 'Arc Testnet',
-  nativeCurrency: { name: 'USDC', symbol: 'USDC', decimals: 18 },
-  rpcUrls: { default: { http: [ARC_RPC] } },
-  blockExplorers: { default: { name: 'Arc Testnet Explorer', url: EXPLORER } },
-  testnet: true,
-});
+let sharedLinkError = null;
+let creationRequiresReview = false;
 
 const invoiceAbi = [
   {
@@ -126,9 +121,9 @@ const invoiceAbi = [
   },
 ];
 
-const publicClient = createPublicClient({ chain: arcTestnet, transport: http(ARC_RPC) });
-const rawTransactionClient = createWalletClient({
-  chain: arcTestnet,
+const publicClient = chain && createPublicClient({ chain, transport: http(ARC_RPC) });
+const rawTransactionClient = chain && createWalletClient({
+  chain,
   transport: http(ARC_RPC, { retryCount: 0 }),
 });
 const $ = (selector) => document.querySelector(selector);
@@ -157,7 +152,7 @@ function parseUsdc(value) {
     throw new Error('Enter a positive USDC amount with no more than six decimal places.');
   }
   const amount = parseUnits(normalized, 18);
-  if (amount <= 0n) throw new Error('Invoice amount must be greater than zero.');
+  if (amount <= 0n || amount > MAX_UINT256) throw new Error('Invoice amount is outside the contract range.');
   return amount;
 }
 
@@ -172,6 +167,8 @@ function makeInvoiceLink(merchant, invoiceId) {
   url.hash = '';
   url.searchParams.set('merchant', merchant);
   url.searchParams.set('invoiceId', invoiceId);
+  url.searchParams.set('chainId', String(CHAIN_ID));
+  url.searchParams.set('contract', CONTRACT_ADDRESS);
   return url.toString();
 }
 
@@ -204,7 +201,7 @@ async function getProvider() {
     address: activeWalletAddress,
     walletClientType: activeWalletType,
   });
-  const provider = fromPrivy || (isEmbeddedWallet ? null : window.ethereum);
+  const provider = fromPrivy || (isEmbeddedWallet || !chain?.testnet ? null : window.ethereum);
   if (!provider?.request) {
     if (isEmbeddedWallet) {
       throw new Error('Privy recognizes this embedded wallet, but its connected provider is not available in this browser. Retry the read-only connection check; no signature or transaction was requested.');
@@ -217,43 +214,115 @@ async function getProvider() {
   return provider;
 }
 
-async function ensureTestnet(provider) {
-  const chainIdHex = `0x${ARC_TESTNET_ID.toString(16)}`;
-  const current = Number.parseInt(await provider.request({ method: 'eth_chainId' }), 16);
-  if (current !== ARC_TESTNET_ID) {
-    try {
-      await provider.request({ method: 'wallet_switchEthereumChain', params: [{ chainId: chainIdHex }] });
-    } catch (error) {
-      if (error?.code !== 4902) throw error;
-      await provider.request({
-        method: 'wallet_addEthereumChain',
-        params: [{
-          chainId: chainIdHex,
-          chainName: 'Arc Testnet',
-          nativeCurrency: { name: 'USDC', symbol: 'USDC', decimals: 18 },
-          rpcUrls: [ARC_RPC],
-          blockExplorerUrls: [EXPLORER],
-        }],
-      });
-      await provider.request({ method: 'wallet_switchEthereumChain', params: [{ chainId: chainIdHex }] });
-    }
+async function ensureWalletNetwork(provider) {
+  const chainIdHex = `0x${CHAIN_ID.toString(16)}`;
+  if (isExpectedHexChainId(await provider.request({ method: 'eth_chainId' }), CHAIN_ID)) return;
+  try {
+    await provider.request({ method: 'wallet_switchEthereumChain', params: [{ chainId: chainIdHex }] });
+  } catch (error) {
+    if (error?.code !== 4902) throw error;
+    await provider.request({
+      method: 'wallet_addEthereumChain',
+      params: [{
+        chainId: chainIdHex,
+        chainName: networkName,
+        nativeCurrency: chain.nativeCurrency,
+        rpcUrls: [ARC_RPC],
+        blockExplorerUrls: [EXPLORER],
+      }],
+    });
+    await provider.request({ method: 'wallet_switchEthereumChain', params: [{ chainId: chainIdHex }] });
   }
-  const verified = Number.parseInt(await provider.request({ method: 'eth_chainId' }), 16);
-  if (verified !== ARC_TESTNET_ID) throw new Error('Switch to Arc Testnet before signing this transaction.');
+  if (!isExpectedHexChainId(await provider.request({ method: 'eth_chainId' }), CHAIN_ID)) {
+    throw new Error(`Switch to ${networkName} before signing this transaction.`);
+  }
 }
 
 async function getWallet() {
-  const provider = await getProvider();
-  await ensureTestnet(provider);
-  const accounts = await provider.request({ method: 'eth_requestAccounts' });
-  if (!accounts?.length) throw new Error('No connected wallet was returned.');
-  const account = getAddress(accounts[0]);
-  if (activeWalletAddress && account.toLowerCase() !== activeWalletAddress.toLowerCase()) {
-    throw new Error('The connected provider returned a different wallet than the one selected in Privy. No transaction was sent.');
+  await verifyInvoiceDeployment(publicClient, arcNetwork);
+  const selectedAddress = activeWalletAddress;
+  const walletType = activeWalletType;
+  const privyUserId = window.arusPayCurrentPrivyUserId;
+  if (!chain.testnet && (!selectedAddress || !privyUserId)) {
+    throw new Error('Connect your wallet through Privy to continue on Arc Mainnet.');
   }
-  const walletClient = createWalletClient({ account, chain: arcTestnet, transport: custom(provider) });
+  const provider = await getProvider();
+  await ensureWalletNetwork(provider);
+  const accounts = await provider.request({ method: 'eth_requestAccounts' });
+  if (!Array.isArray(accounts) || !accounts.length) throw new Error('No connected wallet was returned.');
+  const account = getAddress(accounts[0]);
+  const assertSelection = () => {
+    if (activeWalletAddress !== selectedAddress || activeWalletType !== walletType
+      || window.arusPayCurrentPrivyUserId !== privyUserId
+      || (selectedAddress && getAddress(selectedAddress) !== account)) {
+      throw new Error('The Privy wallet selection changed or the provider returned a different account.');
+    }
+  };
+  const assertReadyToSign = async () => {
+    const connected = await provider.request({ method: 'eth_accounts' });
+    if (!Array.isArray(connected) || !connected[0] || getAddress(connected[0]) !== account) {
+      throw new Error('The wallet account changed. Start again from the selected wallet.');
+    }
+    if (!isExpectedHexChainId(await provider.request({ method: 'eth_chainId' }), CHAIN_ID)) {
+      throw new Error(`The wallet is no longer on ${networkName}.`);
+    }
+    assertSelection();
+  };
+  assertSelection();
+  const walletClient = createWalletClient({ account, chain, transport: custom(provider, { retryCount: 0 }) });
   showWalletStatus(account);
-  return { provider, account, walletClient };
+  return { account, provider, walletClient, walletType, privyUserId, assertReadyToSign };
+}
+
+async function sendInvoiceTransaction(wallet, functionName, args, value, fee, onSubmitted = () => {}) {
+  const { account, provider, walletClient, walletType, assertReadyToSign } = wallet;
+  const request = { account, chain, chainId: CHAIN_ID, to: CONTRACT_ADDRESS,
+    data: encodeFunctionData({ abi: invoiceAbi, functionName, args }), value, ...fee.parameters };
+  await verifyInvoiceDeployment(publicClient, arcNetwork);
+  await assertReadyToSign();
+  if (!['privy', 'privy-v2'].includes(walletType)) {
+    const fees = Object.fromEntries(Object.entries(fee.parameters).map(([key, amount]) => [key, numberToHex(amount)]));
+    if (!chain.testnet) onSubmitted(null);
+    const hash = await provider.request({
+      method: 'eth_sendTransaction',
+      params: [{
+        from: account,
+        to: request.to,
+        data: request.data,
+        chainId: numberToHex(CHAIN_ID),
+        value: numberToHex(value),
+        ...fees,
+      }],
+    }).catch((error) => {
+      if (chain.testnet || error?.code === 4001) throw error;
+      throw new Error('The external wallet submission outcome is ambiguous.', { cause: error });
+    });
+    if (typeof hash !== 'string' || !/^0x[0-9a-f]{64}$/i.test(hash)) {
+      throw new Error('The wallet did not return a valid transaction hash.');
+    }
+    onSubmitted(hash);
+    return hash;
+  }
+  const prepared = await publicClient.prepareTransactionRequest(request);
+  await assertReadyToSign();
+  const serializedTransaction = await walletClient.signTransaction({ ...prepared, account, chain });
+  const signed = parseTransaction(serializedTransaction);
+  const signer = await recoverTransactionAddress({ serializedTransaction });
+  if (!['legacy', 'eip1559'].includes(signed.type) || signed.chainId !== CHAIN_ID || getAddress(signed.to) !== getAddress(request.to)
+    || signed.data !== request.data || (signed.value ?? 0n) !== value || signer !== account
+    || signed.nonce !== prepared.nonce || signed.gas !== fee.parameters.gas
+    || (fee.parameters.gasPrice !== undefined && signed.gasPrice !== fee.parameters.gasPrice)
+    || (fee.parameters.maxFeePerGas !== undefined && (signed.maxFeePerGas !== fee.parameters.maxFeePerGas
+      || signed.maxPriorityFeePerGas !== fee.parameters.maxPriorityFeePerGas))) {
+    throw new Error('The signed transaction differs from the reviewed invoice request.');
+  }
+  await verifyInvoiceDeployment(publicClient, arcNetwork);
+  await assertReadyToSign();
+  onSubmitted(keccak256(serializedTransaction));
+  return broadcastSignedTransactionOnce({
+    serializedTransaction,
+    broadcast: (serialized) => rawTransactionClient.sendRawTransaction({ serializedTransaction: serialized }),
+  });
 }
 
 function readInvoiceResult(result) {
@@ -268,28 +337,51 @@ function readInvoiceResult(result) {
   };
 }
 
-async function getOnchainInvoice(merchant, invoiceId) {
+async function getOnchainInvoice(merchant, invoiceId, verify = true) {
+  if (verify) await verifyInvoiceDeployment(publicClient, arcNetwork);
+  const expectedMerchant = getAddress(merchant);
   const result = await publicClient.readContract({
     address: CONTRACT_ADDRESS,
     abi: invoiceAbi,
     functionName: 'getInvoice',
-    args: [getAddress(merchant), invoiceId],
+    args: [expectedMerchant, invoiceId],
   });
-  return readInvoiceResult(result);
+  const invoice = readInvoiceResult(result);
+  if (invoice.status !== STATUS.none && (invoice.merchant !== expectedMerchant || invoice.amount <= 0n
+    || ![STATUS.open, STATUS.paid, STATUS.cancelled].includes(invoice.status))) {
+    throw new Error('The contract returned an invalid invoice record.');
+  }
+  return invoice;
 }
 
 function paymentAttemptKey(merchant, invoiceId) {
-  return `${merchant.toLowerCase()}:${String(invoiceId).toLowerCase()}`;
+  return `${CHAIN_ID}:${CONTRACT_ADDRESS}:${merchant.toLowerCase()}:${String(invoiceId).toLowerCase()}`;
 }
-function getUncertainPaymentAttempt(merchant, invoiceId) {
-  const key = paymentAttemptKey(merchant, invoiceId);
-  const attempt = uncertainPaymentAttempts.get(key) || null;
-  return attempt && attempt.merchant?.toLowerCase() === merchant.toLowerCase()
-    && attempt.invoiceId?.toLowerCase() === invoiceId.toLowerCase()
-    && attempt.privyUserId === window.arusPayCurrentPrivyUserId ? attempt : null;
+function localPaymentAttemptKey(key, userId) {
+  return 'termul.payment-attempt:' + userId + ':' + key;
 }
 
-function setUncertainPaymentAttempt(merchant, invoiceId, payer, transactionHash = null, amount = null) {
+function getUncertainPaymentAttempt(merchant, invoiceId) {
+  const key = paymentAttemptKey(merchant, invoiceId);
+  const userId = window.arusPayCurrentPrivyUserId || null;
+  let persisted = null;
+  if (chain?.testnet === false && userId) {
+    try {
+      const raw = window.localStorage.getItem(localPaymentAttemptKey(key, userId));
+      persisted = raw && JSON.parse(raw);
+    } catch {
+      // The cloud hint or in-memory record can still be used for read-only reconciliation.
+    }
+  }
+  const inMemory = uncertainPaymentAttempts.get(key);
+  const attempt = inMemory?.privyUserId === userId && (!persisted || inMemory.updatedAt >= persisted.updatedAt)
+    ? inMemory : persisted;
+  return attempt && attempt.merchant?.toLowerCase() === merchant.toLowerCase()
+    && attempt.invoiceId?.toLowerCase() === invoiceId.toLowerCase()
+    && attempt.privyUserId === userId ? attempt : null;
+}
+
+function setUncertainPaymentAttempt(merchant, invoiceId, payer, transactionHash = null, amount = null, submission = null) {
   const key = paymentAttemptKey(merchant, invoiceId);
   const attempt = {
     merchant: getAddress(merchant),
@@ -298,13 +390,22 @@ function setUncertainPaymentAttempt(merchant, invoiceId, payer, transactionHash 
     transactionHash,
     amount: amount === null || amount === undefined ? null : BigInt(amount).toString(),
     updatedAt: Date.now(),
-    privyUserId: window.arusPayCurrentPrivyUserId || null,
+    privyUserId: submission ? submission.privyUserId : window.arusPayCurrentPrivyUserId || null,
   };
-  uncertainPaymentAttempts.set(key, attempt);
-  paymentReconciliationWatchComplete.delete(key);
-  if (attempt.privyUserId && attempt.payer) {
-    void metadataApi.savePaymentAttempt(merchant, invoiceId, attempt.payer, transactionHash)
-      .catch(() => showToast('The payment attempt could not sync to Supabase. Termul will continue checking the contract directly.'));
+  if (chain?.testnet === false && attempt.privyUserId && attempt.payer) {
+    try {
+      window.localStorage.setItem(localPaymentAttemptKey(key, attempt.privyUserId), JSON.stringify(attempt));
+    } catch {
+      if (submission && !submission.started) throw new Error('Browser storage must be available to recover a Mainnet payment.');
+    }
+  }
+  if (attempt.privyUserId === (window.arusPayCurrentPrivyUserId || null)) {
+    uncertainPaymentAttempts.set(key, attempt);
+    paymentReconciliationWatchComplete.delete(key);
+    if (attempt.privyUserId && attempt.payer) {
+      void metadataApi.savePaymentAttempt(merchant, invoiceId, attempt.payer, transactionHash)
+        .catch(() => showToast('The payment attempt could not sync to Supabase. Termul will continue checking the contract directly.'));
+    }
   }
   return attempt;
 }
@@ -313,7 +414,11 @@ function clearUncertainPaymentAttempt(merchant, invoiceId) {
   const key = paymentAttemptKey(merchant, invoiceId);
   uncertainPaymentAttempts.delete(key);
   paymentReconciliationWatchComplete.delete(key);
-  if (window.arusPayCurrentPrivyUserId) {
+  const userId = window.arusPayCurrentPrivyUserId;
+  if (userId) {
+    if (chain?.testnet === false) {
+      try { window.localStorage.removeItem(localPaymentAttemptKey(key, userId)); } catch { /* Read-only recovery stays available. */ }
+    }
     void metadataApi.clearPaymentAttempt(merchant, invoiceId).catch(() => {});
   }
 }
@@ -352,6 +457,7 @@ async function getInvoicePaymentLogs(merchant, invoiceId) {
     const page = await publicClient.getLogs({
       address: CONTRACT_ADDRESS,
       event,
+      strict: true,
       args: { merchant: getAddress(merchant), invoiceId },
       fromBlock,
       toBlock,
@@ -367,7 +473,7 @@ async function reconcileOnchainPayment({ merchant, invoiceId, amount, payer, tra
   const expectedAmount = BigInt(amount);
   return reconcilePaymentAttempt({
     expected: {
-      chainId: ARC_TESTNET_ID,
+      chainId: CHAIN_ID,
       contract: CONTRACT_ADDRESS,
       merchant: getAddress(merchant),
       invoiceId,
@@ -424,6 +530,7 @@ function startPaymentReconciliationWatch({ merchant, invoiceId, amount = null, p
       });
     },
     onUpdate: async (outcome) => {
+      if (window.arusPayCurrentPrivyUserId !== watchUserId) return;
       const attempt = getUncertainPaymentAttempt(merchant, invoiceId);
       if (!attempt) return;
       if (outcome.paymentTxHash && outcome.paymentTxHash !== attempt.transactionHash) {
@@ -442,7 +549,7 @@ function startPaymentReconciliationWatch({ merchant, invoiceId, amount = null, p
         } else {
           clearUncertainPaymentAttempt(merchant, invoiceId);
         }
-        window.arusPayApi?.updateInvoice(invoiceId, {
+        window.arusPayApi?.updateInvoice(merchant, invoiceId, {
           status: 'paid',
           ...(outcome.payer ? { payer: outcome.payer } : {}),
           ...(outcome.paymentTxHash ? {
@@ -474,7 +581,7 @@ function startPaymentReconciliationWatch({ merchant, invoiceId, amount = null, p
   }).finally(async () => {
     paymentReconciliationWatchers.delete(key);
     if (getUncertainPaymentAttempt(merchant, invoiceId)) {
-      paymentReconciliationWatchComplete.add(key);
+      if (window.arusPayCurrentPrivyUserId === watchUserId) paymentReconciliationWatchComplete.add(key);
       await renderPayment();
     }
   });
@@ -492,6 +599,7 @@ async function getMerchantEventLogs(eventName, merchant, latestBlock) {
     const page = await publicClient.getLogs({
       address: CONTRACT_ADDRESS,
       event,
+      strict: true,
       args: { merchant },
       fromBlock,
       toBlock,
@@ -519,8 +627,7 @@ async function getOptionalBlockTimestamp(log, timestampCache) {
 
 async function syncMerchantInvoices(merchantAddress) {
   const merchant = getAddress(merchantAddress);
-  const chainId = await publicClient.getChainId();
-  if (chainId !== ARC_TESTNET_ID) throw new Error('Arc Testnet could not be verified. Invoice data was not updated.');
+  await verifyInvoiceDeployment(publicClient, arcNetwork);
   let storedRows = [];
   try {
     const result = await metadataApi.listInvoices(merchant);
@@ -537,14 +644,16 @@ async function syncMerchantInvoices(merchantAddress) {
   const paidByInvoice = new Map();
   for (const log of paidLogs) {
     const args = log.args;
-    if (!args?.invoiceId || args.merchant?.toLowerCase() !== merchant.toLowerCase()) continue;
+    if (!args?.invoiceId || log.removed || log.address?.toLowerCase() !== CONTRACT_ADDRESS
+      || !log.transactionHash || args.merchant?.toLowerCase() !== merchant.toLowerCase()) continue;
     const key = args.invoiceId.toLowerCase();
     if (paidByInvoice.has(key)) throw new Error('Arc returned duplicate payment events; invoice data was not updated.');
     paidByInvoice.set(key, log);
   }
 
   const metadataById = new Map(storedRows
-    .filter((row) => row?.invoice_id && row.merchant_address?.toLowerCase() === merchant.toLowerCase())
+    .filter((row) => row?.invoice_id && row.merchant_address?.toLowerCase() === merchant.toLowerCase()
+      && row.chain_id === CHAIN_ID && row.contract_address?.toLowerCase() === CONTRACT_ADDRESS)
     .map((row) => {
       const name = row.client_name || 'On-chain invoice';
       return [row.invoice_id.toLowerCase(), {
@@ -559,7 +668,7 @@ async function syncMerchantInvoices(merchantAddress) {
     }));
   const previousById = new Map(metadataById);
   for (const item of window.arusPayApi?.getInvoices() || []) {
-    if (!item.invoiceId) continue;
+    if (!item.invoiceId || item.merchant?.toLowerCase() !== merchant.toLowerCase()) continue;
     const key = item.invoiceId.toLowerCase();
     previousById.set(key, { ...previousById.get(key), ...item });
   }
@@ -567,11 +676,12 @@ async function syncMerchantInvoices(merchantAddress) {
   const synced = [];
   for (const createdLog of createdLogs) {
     const created = createdLog.args;
-    if (!created?.invoiceId || created.merchant?.toLowerCase() !== merchant.toLowerCase()) continue;
+    if (!created?.invoiceId || createdLog.removed || createdLog.address?.toLowerCase() !== CONTRACT_ADDRESS
+      || !createdLog.transactionHash || created.merchant?.toLowerCase() !== merchant.toLowerCase()) continue;
     const invoiceId = created.invoiceId;
     const key = invoiceId.toLowerCase();
     const known = previousById.get(key);
-    const invoice = await getOnchainInvoice(merchant, invoiceId);
+    const invoice = await getOnchainInvoice(merchant, invoiceId, false);
     if (invoice.status === STATUS.none
       || invoice.amount !== BigInt(created.amount)
       || invoice.expiresAt !== BigInt(created.expiresAt)) {
@@ -596,9 +706,10 @@ async function syncMerchantInvoices(merchantAddress) {
       id: known?.id || `INV-${invoiceId.slice(2, 10).toUpperCase()}`,
       invoiceId,
       merchant,
-      amount: Number(formatUnits(invoice.amount, 18)),
+      amount: formatUnits(invoice.amount, 18),
       amountBase: invoice.amount.toString(),
-      due: invoice.expiresAt === 0n ? '' : new Date(Number(invoice.expiresAt) * 1000).toISOString().slice(0, 10),
+      due: invoice.expiresAt === 0n || invoice.expiresAt > MAX_FORMATTED_TIMESTAMP
+        ? '' : new Date(Number(invoice.expiresAt) * 1000).toISOString().slice(0, 10),
       name: known?.name || 'On-chain invoice',
       description: known?.description || 'On-chain invoice',
       initials: known?.initials || 'AP',
@@ -618,17 +729,25 @@ async function syncMerchantInvoices(merchantAddress) {
   return synced.reverse();
 }
 
-async function estimateFee(functionName, args, account, value) {
-  const gas = await publicClient.estimateContractGas({
-    account,
-    address: CONTRACT_ADDRESS,
-    abi: invoiceAbi,
-    functionName,
-    args,
-    ...(value === undefined ? {} : { value }),
-  });
-  const gasPrice = await publicClient.getGasPrice();
-  return { gas, fee: gas * gasPrice };
+async function estimateFee(functionName, args, account, value = 0n) {
+  const request = { account, address: CONTRACT_ADDRESS, abi: invoiceAbi, functionName, args, value };
+  const gas = await publicClient.estimateContractGas(request);
+  const parameters = { gas };
+  let feeCap;
+  if (chain.testnet) {
+    parameters.gasPrice = await publicClient.getGasPrice();
+    feeCap = parameters.gasPrice;
+  } else {
+    const { maxFeePerGas, maxPriorityFeePerGas } = await publicClient.estimateFeesPerGas();
+    parameters.maxPriorityFeePerGas = maxPriorityFeePerGas;
+    parameters.maxFeePerGas = maxFeePerGas < 20_000_000_000n ? 20_000_000_000n : maxFeePerGas;
+    feeCap = parameters.maxFeePerGas;
+  }
+  const fee = gas * feeCap;
+  if (await publicClient.getBalance({ address: account }) < value + fee) {
+    throw new Error('Insufficient native USDC for the invoice amount and estimated network fee.');
+  }
+  return { parameters, fee };
 }
 
 function amountFromForm() {
@@ -636,13 +755,14 @@ function amountFromForm() {
   const descriptions = [];
   for (const row of $$('.line-item')) {
     const quantityText = row.querySelector('.item-qty').value;
-    if (!/^\d+$/.test(quantityText) || Number(quantityText) < 1) throw new Error('Quantity must be a positive whole number.');
+    if (!/^\d+$/.test(quantityText) || BigInt(quantityText) < 1n) throw new Error('Quantity must be a positive whole number.');
     const quantity = BigInt(quantityText);
     const price = parseUsdc(row.querySelector('.item-price').value);
     total += price * quantity;
     const description = row.querySelector('.item-description').value.trim();
     if (description) descriptions.push(description);
   }
+  if (total > MAX_UINT256) throw new Error('Invoice total exceeds the contract range.');
   return { total, description: descriptions.join(', ') };
 }
 
@@ -665,7 +785,7 @@ function formInvoiceMetadata() {
     name,
     email,
     description,
-    amount: Number(formatUnits(total, 18)),
+    amount: formatUnits(total, 18),
     amountBase: total.toString(),
     due: $('#due-date').value,
     initials: name.split(/\s+/).filter(Boolean).map((part) => part[0]).join('').slice(0, 2).toUpperCase() || 'CL',
@@ -675,6 +795,14 @@ function formInvoiceMetadata() {
 }
 
 async function createOnchainInvoice() {
+  if (arcNetwork.error) {
+    showToast(arcNetwork.error);
+    return;
+  }
+  if (creationRequiresReview) {
+    showToast('Check the previous creation transaction and refresh the invoice dashboard before creating another invoice.');
+    return;
+  }
   const form = $('#invoice-form');
   const submit = form.querySelector('[type="submit"]');
   const started = await runInvoiceCreationIfIdle(async () => {
@@ -696,16 +824,17 @@ async function createOnchainInvoice() {
       status.classList.toggle('hidden', !message);
     };
     const updateStatus = (message) => {
-      submit.textContent = message ? 'Checking Arc Testnet…' : originalSubmit;
+      submit.textContent = message ? `Checking ${networkName}…` : originalSubmit;
       setStatus(message);
     };
     try {
       const metadata = formInvoiceMetadata();
       const expiresAt = expirationFromForm();
       const invoiceId = randomInvoiceId();
-      const { account, walletClient } = await getWallet();
+      const wallet = await getWallet();
+      const { account } = wallet;
       const expected = {
-        chainId: ARC_TESTNET_ID,
+        chainId: CHAIN_ID,
         contract: CONTRACT_ADDRESS,
         merchant: account,
         invoiceId,
@@ -725,38 +854,7 @@ async function createOnchainInvoice() {
         readTransaction: (hash) => publicClient.getTransaction({ hash }),
       });
       const attempt = await submitInvoiceCreationOnce({
-        submit: async () => {
-          if (['privy', 'privy-v2'].includes(activeWalletType)) {
-            const preparedTransaction = await publicClient.prepareTransactionRequest({
-              account,
-              chain: arcTestnet,
-              chainId: ARC_TESTNET_ID,
-              to: CONTRACT_ADDRESS,
-              data: encodeFunctionData({
-                abi: invoiceAbi,
-                functionName: 'createInvoice',
-                args: [invoiceId, expected.amount, expiresAt],
-              }),
-              value: 0n,
-            });
-            const serializedTransaction = await walletClient.signTransaction({
-              ...preparedTransaction,
-              account,
-              chain: arcTestnet,
-            });
-            return broadcastSignedTransactionOnce({
-              serializedTransaction,
-              broadcast: (serialized) => rawTransactionClient.sendRawTransaction({ serializedTransaction: serialized }),
-            });
-          }
-          return walletClient.writeContract({
-            account,
-            address: CONTRACT_ADDRESS,
-            abi: invoiceAbi,
-            functionName: 'createInvoice',
-            args: [invoiceId, expected.amount, expiresAt],
-          });
-        },
+        submit: () => sendInvoiceTransaction(wallet, 'createInvoice', [invoiceId, expected.amount, expiresAt], 0n, fee),
         waitForReceipt: (hash) => publicClient.waitForTransactionReceipt({
           hash,
           timeout: 45000,
@@ -778,12 +876,13 @@ async function createOnchainInvoice() {
           }),
           onUpdate: (result) => {
             if (!['created', 'reverted', 'failed', 'unmatched'].includes(result.status)) {
-              updateStatus('Still checking the same transaction on Arc Testnet. Do not retry or approve again.');
+              updateStatus(`Still checking the same transaction on ${networkName}. Do not retry or approve again.`);
             }
           },
         });
       }
 
+      if (wallet.privyUserId !== window.arusPayCurrentPrivyUserId) return;
       if (outcome.status === 'created') {
         const hash = outcome.transactionHash;
         const record = {
@@ -808,7 +907,7 @@ async function createOnchainInvoice() {
         let metadataSaveError = '';
         try {
           await metadataApi.saveInvoice({
-            chainId: ARC_TESTNET_ID,
+            chainId: CHAIN_ID,
             contractAddress: CONTRACT_ADDRESS,
             merchantAddress: account,
             invoiceId,
@@ -824,19 +923,22 @@ async function createOnchainInvoice() {
           metadataSaveError = error?.message || '';
         }
         showToast(metadataSaved
-          ? 'Invoice confirmed on Arc Testnet. Its payment link is ready to copy.'
-          : metadataSaveError || 'Invoice confirmed on Arc Testnet; its payment link is ready, but details could not sync to Supabase.');
+          ? `Invoice confirmed on ${networkName}. Its payment link is ready to copy.`
+          : metadataSaveError || `Invoice confirmed on ${networkName}; its payment link is ready, but details could not sync to Supabase.`);
       } else if (outcome.status === 'reverted') {
-        setStatus('Arc Testnet confirmed that this transaction reverted. No invoice was created.');
+        setStatus(`${networkName} confirmed that this transaction reverted. No invoice was created.`);
         showToast('The transaction reverted. No invoice is recorded, and Termul did not resend it.');
       } else if (outcome.status === 'failed') {
         setStatus('No invoice transaction was confirmed. You may review the form and decide what to do next.');
         showToast(attempt.error?.shortMessage || attempt.error?.message || 'Invoice creation was not submitted.');
       } else if (outcome.status === 'unmatched') {
+        creationRequiresReview = true;
         setStatus('The transaction could not be matched to this exact invoice. No payment link was created.');
         showToast('The receipt did not match this invoice ID, merchant, amount, and expiry. No invoice link was created.');
       } else {
-        setStatus('The exact transaction is still unverified. This form remains locked to prevent a duplicate invoice; check again later.');
+        creationRequiresReview = true;
+        const review = outcome.transactionHash || attempt.transactionHash;
+        setStatus(`The exact transaction is still unverified. Check the invoice dashboard and wallet history before trying again.${review ? ' Transaction hash to review: ' + review : ''}`);
         showToast('The outcome is still uncertain. No second transaction was sent and no invoice was marked successful.');
       }
     } catch (error) {
@@ -844,7 +946,7 @@ async function createOnchainInvoice() {
       showToast(error?.shortMessage || error?.message || 'Invoice creation failed. No success is recorded without a confirmed receipt.');
     } finally {
       if (submit?.isConnected) {
-        submit.disabled = false;
+        submit.disabled = creationRequiresReview;
         submit.innerHTML = originalSubmit;
       }
     }
@@ -862,7 +964,7 @@ function statusText(status, expiresAt) {
 
 function renderPaymentUnavailable(message, merchant = '', invoiceId = '') {
   const view = $('#payment-view');
-  view.innerHTML = `<div class="panel payment-empty"><div class="payment-unavailable" role="status"><div class="availability-icon" aria-hidden="true">!</div><span class="eyebrow">Arc Testnet invoice</span><h1>Invoice unavailable</h1><p>${escapeHtml(message)}</p><p>The app will not submit a payment while contract status is unavailable. Check status again when the Arc RPC responds.</p>${merchant && invoiceId ? `<div class="availability-details"><span><b>Merchant</b> ${escapeHtml(merchant)}</span><span><b>Invoice ID</b> <span class="mono">${escapeHtml(shortId(invoiceId))}</span></span></div>` : ''}<button class="btn btn-quiet" id="retry-payment-status" type="button">Check payment status</button> <button class="btn btn-quiet" id="payment-back">Back to invoices</button></div></div>`;
+  view.innerHTML = `<div class="panel payment-empty"><div class="payment-unavailable" role="status"><div class="availability-icon" aria-hidden="true">!</div><span class="eyebrow">${networkName} invoice</span><h1>Invoice unavailable</h1><p>${escapeHtml(message)}</p><p>The app will not submit a payment while contract status is unavailable. Check status again when the Arc RPC responds.</p>${merchant && invoiceId ? `<div class="availability-details"><span><b>Merchant</b> ${escapeHtml(merchant)}</span><span><b>Invoice ID</b> <span class="mono">${escapeHtml(shortId(invoiceId))}</span></span></div>` : ''}<button class="btn btn-quiet" id="retry-payment-status" type="button">Check payment status</button> <button class="btn btn-quiet" id="payment-back">Back to invoices</button></div></div>`;
   $('#retry-payment-status')?.addEventListener('click', () => {
     if (merchant && invoiceId) paymentReconciliationWatchComplete.delete(paymentAttemptKey(merchant, invoiceId));
     void renderPayment();
@@ -874,19 +976,21 @@ async function renderPayment() {
   const requestId = ++paymentRenderRequest;
   const view = $('#payment-view');
   const selected = window.arusPayApi?.getSelectedInvoice();
+  const renderUserId = window.arusPayCurrentPrivyUserId;
+  const isCurrentRender = () => requestId === paymentRenderRequest && renderUserId === window.arusPayCurrentPrivyUserId;
   if (!selected?.merchant || !selected?.invoiceId) {
-    renderPaymentUnavailable('Select an invoice or open a valid Arc Testnet payment link.');
+    renderPaymentUnavailable(sharedLinkError || arcNetwork.error || `Select an invoice or open a valid ${networkName} payment link.`);
     return;
   }
-  view.innerHTML = '<div class="panel payment-empty"><div class="empty-state"><strong>Reading Arc Testnet</strong><span>Checking invoice state directly from the contract…</span></div></div>';
+  view.innerHTML = `<div class="panel payment-empty"><div class="empty-state"><strong>Reading ${networkName}</strong><span>Checking invoice state directly from the contract…</span></div></div>`;
   try {
     let invoice = await getOnchainInvoice(selected.merchant, selected.invoiceId);
-    if (requestId !== paymentRenderRequest) return;
+    if (!isCurrentRender()) return;
     let paymentAttempt = getUncertainPaymentAttempt(selected.merchant, selected.invoiceId);
     if (!paymentAttempt) {
       try {
         const stored = await metadataApi.getPaymentAttempt(selected.merchant, selected.invoiceId);
-        if (requestId !== paymentRenderRequest) return;
+        if (!isCurrentRender()) return;
         paymentAttempt = hydrateUncertainPaymentAttempt(selected.merchant, selected.invoiceId, stored?.attempt);
       } catch {
         // A cloud hint never substitutes for the contract read above.
@@ -902,7 +1006,7 @@ async function renderPayment() {
         transactionHash: paymentAttempt?.transactionHash || null,
         error: paymentAttempt ? new Error('A previous wallet submission has an ambiguous result.') : null,
       });
-      if (requestId !== paymentRenderRequest) return;
+      if (!isCurrentRender()) return;
       if (paymentReconciliation.invoice) invoice = paymentReconciliation.invoice;
       if ((paymentReconciliation.status === 'paid'
           && !paymentReconciliation.contractStatePending
@@ -923,7 +1027,7 @@ async function renderPayment() {
             invoice.amount,
           );
         }
-        window.arusPayApi?.updateInvoice(selected.invoiceId, {
+        window.arusPayApi?.updateInvoice(selected.merchant, selected.invoiceId, {
           status: 'paid',
           ...(paymentReconciliation.payer ? { payer: paymentReconciliation.payer } : {}),
           ...(paymentReconciliation.paymentTxHash ? {
@@ -934,7 +1038,8 @@ async function renderPayment() {
         });
       }
     }
-    const known = window.arusPayApi?.getInvoices().find((item) => item.invoiceId?.toLowerCase() === selected.invoiceId.toLowerCase());
+    const known = window.arusPayApi?.getInvoices().find((item) => item.invoiceId?.toLowerCase() === selected.invoiceId.toLowerCase()
+      && item.merchant?.toLowerCase() === selected.merchant.toLowerCase());
     const paymentDisplay = getPaymentDisplayState({
       invoiceStatus: invoice.status,
       paymentStatus: paymentReconciliation?.status,
@@ -946,11 +1051,12 @@ async function renderPayment() {
     const status = paymentDisplay.label;
     if (invoice.status === STATUS.none) throw new Error('This invoice ID does not exist for the specified merchant.');
     const amount = formatUsdc(invoice.amount);
-    const due = invoice.expiresAt === 0n ? 'No expiry' : new Date(Number(invoice.expiresAt) * 1000).toLocaleString('en-US');
+    const due = invoice.expiresAt === 0n ? 'No expiry' : invoice.expiresAt > MAX_FORMATTED_TIMESTAMP
+      ? `Unix timestamp ${invoice.expiresAt}` : new Date(Number(invoice.expiresAt) * 1000).toLocaleString('en-US');
     const link = makeInvoiceLink(invoice.merchant, selected.invoiceId);
     const canPay = paymentDisplay.canPay;
     const stateClass = paymentDisplay.paid ? 'paid' : invoice.status === STATUS.cancelled || status === 'Expired' ? 'overdue' : 'pending';
-    view.innerHTML = `<div class="pay-crumb"><button class="table-link" id="payment-invoices">Invoices</button> <span style="color:#596578">/</span> <span class="mono">${escapeHtml(shortId(selected.invoiceId))}</span></div><div class="pay-layout"><section class="pay-main-card"><div class="pay-business"><div class="business-logo">AP</div><div><strong>Termul invoice</strong><span class="mono">${escapeHtml(shortId(selected.invoiceId))}</span></div></div><div class="pay-content"><span class="eyebrow">Arc Testnet · On-chain status</span><h1>${escapeHtml(status)}</h1><p>${known ? `Invoice for ${escapeHtml(known.name)}` : 'Invoice details read from Arc Testnet.'}</p><div class="pay-due"><div class="pay-due-label">${invoice.status === STATUS.paid ? 'Amount paid' : 'Amount due'}</div><div class="pay-due-amount">${escapeHtml(amount)} <span>USDC</span></div></div><div class="pay-network"><span class="chain-name"><i class="chain-icon">A</i> Arc Testnet</span><span class="status ${stateClass}">${escapeHtml(status)}</span></div><div class="availability-details"><span><b>Merchant</b> <span class="mono">${escapeHtml(invoice.merchant)}</span></span><span><b>Due / expiry</b> ${escapeHtml(due)}</span><span><b>Invoice ID</b> <span class="mono">${escapeHtml(selected.invoiceId)}</span></span></div><div class="fee-note"><span>ⓘ</span><span>Estimated fees are paid by your wallet in USDC. No gas sponsorship is used.</span></div>${canPay ? '<button class="btn btn-primary btn-full" id="pay-onchain" type="button">Pay invoice on Arc Testnet</button>' : ''}<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px"><button class="btn btn-quiet btn-sm" id="copy-invoice-link" type="button">Copy payment link</button><a class="btn btn-quiet btn-sm" href="${EXPLORER}/address/${CONTRACT_ADDRESS}" target="_blank" rel="noreferrer">View contract</a></div>${known?.createTxHash ? `<p class="hint">Creation receipt: <a class="table-link" href="${EXPLORER}/tx/${known.createTxHash}" target="_blank" rel="noreferrer">${escapeHtml(shortAddress(known.createTxHash))}</a></p>` : ''}${known?.paymentTxHash ? `<p class="hint">Payment receipt: <a class="table-link" href="${EXPLORER}/tx/${known.paymentTxHash}" target="_blank" rel="noreferrer">${escapeHtml(shortAddress(known.paymentTxHash))}</a></p>` : ''}<p class="hint">Client name, email, descriptions, and notes are not written to the contract.</p></div></section><aside class="pay-summary"><h2>Invoice summary</h2><div class="summary-row"><span>Invoice number</span><strong>${escapeHtml(known?.id || shortId(selected.invoiceId))}</strong></div><div class="summary-row"><span>Client</span><strong>${escapeHtml(known?.name || 'Invoice recipient')}</strong></div><div class="summary-row"><span>Description</span><strong>${escapeHtml(known?.description || 'On-chain invoice')}</strong></div><div class="summary-row"><span>Due date</span><strong>${escapeHtml(due)}</strong></div><div class="summary-row summary-total"><span>Total</span><strong>${escapeHtml(amount)} USDC</strong></div><div class="payment-foot">State is read from the Arc Testnet contract.</div></aside></div>`;
+    view.innerHTML = `<div class="pay-crumb"><button class="table-link" id="payment-invoices">Invoices</button> <span style="color:#596578">/</span> <span class="mono">${escapeHtml(shortId(selected.invoiceId))}</span></div><div class="pay-layout"><section class="pay-main-card"><div class="pay-business"><div class="business-logo">AP</div><div><strong>Termul invoice</strong><span class="mono">${escapeHtml(shortId(selected.invoiceId))}</span></div></div><div class="pay-content"><span class="eyebrow">${networkName} · On-chain status</span><h1>${escapeHtml(status)}</h1><p>${known ? `Invoice for ${escapeHtml(known.name)}` : `Invoice details read from ${networkName}.`}</p><div class="pay-due"><div class="pay-due-label">${invoice.status === STATUS.paid ? 'Amount paid' : 'Amount due'}</div><div class="pay-due-amount">${escapeHtml(amount)} <span>USDC</span></div></div><div class="pay-network"><span class="chain-name"><i class="chain-icon">A</i> ${networkName}</span><span class="status ${stateClass}">${escapeHtml(status)}</span></div><div class="availability-details"><span><b>Merchant</b> <span class="mono">${escapeHtml(invoice.merchant)}</span></span><span><b>Due / expiry</b> ${escapeHtml(due)}</span><span><b>Invoice ID</b> <span class="mono">${escapeHtml(selected.invoiceId)}</span></span></div><div class="fee-note"><span>ⓘ</span><span>Estimated fees are paid by your wallet in USDC. No gas sponsorship is used.</span></div>${canPay ? `<button class="btn btn-primary btn-full" id="pay-onchain" type="button">Pay invoice on ${networkName}</button>` : ''}<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px"><button class="btn btn-quiet btn-sm" id="copy-invoice-link" type="button">Copy payment link</button><a class="btn btn-quiet btn-sm" href="${EXPLORER}/address/${CONTRACT_ADDRESS}" target="_blank" rel="noreferrer">View contract</a></div>${known?.createTxHash ? `<p class="hint">Creation receipt: <a class="table-link" href="${EXPLORER}/tx/${known.createTxHash}" target="_blank" rel="noreferrer">${escapeHtml(shortAddress(known.createTxHash))}</a></p>` : ''}${known?.paymentTxHash ? `<p class="hint">Payment receipt: <a class="table-link" href="${EXPLORER}/tx/${known.paymentTxHash}" target="_blank" rel="noreferrer">${escapeHtml(shortAddress(known.paymentTxHash))}</a></p>` : ''}<p class="hint">Client name, email, descriptions, and notes are not written to the contract.</p></div></section><aside class="pay-summary"><h2>Invoice summary</h2><div class="summary-row"><span>Invoice number</span><strong>${escapeHtml(known?.id || shortId(selected.invoiceId))}</strong></div><div class="summary-row"><span>Client</span><strong>${escapeHtml(known?.name || 'Invoice recipient')}</strong></div><div class="summary-row"><span>Description</span><strong>${escapeHtml(known?.description || 'On-chain invoice')}</strong></div><div class="summary-row"><span>Due date</span><strong>${escapeHtml(due)}</strong></div><div class="summary-row summary-total"><span>Total</span><strong>${escapeHtml(amount)} USDC</strong></div><div class="payment-foot">State is read from the ${networkName} contract.</div></aside></div>`;
     if (known?.paymentTxHash && !paymentReconciliation?.paymentTxHash) {
       const staleReceipt = [...view.querySelectorAll('a')]
         .find((anchor) => anchor.href === `${EXPLORER}/tx/${known.paymentTxHash}`);
@@ -1061,12 +1167,12 @@ async function renderPayment() {
       walletHint.textContent = !activeWalletAddress
         ? 'Invoice status is read from the deployed invoice contract. Connect an Ethereum wallet to pay.'
         : activeWalletProviderState === 'checking'
-          ? `Checking the ${isPrivyWallet ? 'Privy ' : ''}wallet provider and verifying Arc Testnet (chain ID ${ARC_TESTNET_ID}) using a read-only request. No signature or transaction has been requested.`
+          ? `Checking the ${isPrivyWallet ? 'Privy ' : ''}wallet provider and verifying ${networkName} (chain ID ${CHAIN_ID}) using a read-only request. No signature or transaction has been requested.`
           : !providerVerified
-            ? activeWalletProviderError || 'The wallet provider and Arc Testnet network have not been verified. Review the safe connection diagnostics below; no signature or transaction was requested.'
+            ? activeWalletProviderError || `The wallet provider and ${networkName} network have not been verified. Review the safe connection diagnostics below; no signature or transaction was requested.`
             : isPrivyWallet
-              ? 'The Privy provider answered a read-only Arc Testnet network check. Signing has not been tested here; no signature or transaction has been requested.'
-              : `Wallet provider for ${shortAddress(activeWalletAddress)} answered a read-only Arc Testnet network check. No signature or transaction has been requested.`;
+              ? `The Privy provider answered a read-only ${networkName} network check. Signing has not been tested here; no signature or transaction has been requested.`
+              : `Wallet provider for ${shortAddress(activeWalletAddress)} answered a read-only ${networkName} network check. No signature or transaction has been requested.`;
       paymentButton.before(walletHint);
       if (activeWalletAddress && !providerVerified) {
         paymentButton.disabled = true;
@@ -1079,6 +1185,24 @@ async function renderPayment() {
           const diagnostics = window.arusPayPrivy?.getRuntimeDiagnostics?.(diagnosticArgs)
             || createSafeWalletDiagnostics(diagnosticArgs);
           paymentButton.after(createWalletDiagnosticsPanel(diagnostics));
+          if (activeWalletChainId && !isExpectedHexChainId(activeWalletChainId, CHAIN_ID)) {
+            const switchButton = document.createElement('button');
+            switchButton.type = 'button';
+            switchButton.className = 'btn btn-quiet btn-sm';
+            switchButton.textContent = `Switch wallet to ${networkName}`;
+            switchButton.addEventListener('click', async () => {
+              switchButton.disabled = true;
+              try {
+                await ensureWalletNetwork(await getProvider());
+                await checkActiveWalletProvider();
+              } catch (error) {
+                showToast(error?.message || 'Could not switch the wallet network.');
+              } finally {
+                switchButton.disabled = false;
+              }
+            });
+            paymentButton.after(switchButton);
+          }
         }
       }
     }
@@ -1093,7 +1217,7 @@ async function renderPayment() {
     });
     paymentButton?.addEventListener('click', () => {
       if (activeWalletAddress && (activeWalletProviderState !== 'connected' || !activeWalletProviderReady)) return;
-      if (!activeWalletAddress && !window.ethereum?.request) {
+      if (!activeWalletAddress && (!chain.testnet || !window.ethereum?.request)) {
         if (window.arusPayPrivy?.login) {
           void window.arusPayPrivy.login('wallet');
         } else {
@@ -1101,10 +1225,10 @@ async function renderPayment() {
         }
         return;
       }
-      void payInvoice(invoice.merchant, selected.invoiceId, invoice.amount);
+      if (isCurrentRender()) void payInvoice(invoice.merchant, selected.invoiceId, invoice.amount);
     });
   } catch (error) {
-    if (requestId !== paymentRenderRequest) return;
+    if (!isCurrentRender()) return;
     const paymentAttempt = getUncertainPaymentAttempt(selected.merchant, selected.invoiceId);
     if (paymentAttempt && !paymentReconciliationWatchComplete.has(paymentAttemptKey(selected.merchant, selected.invoiceId))) {
       startPaymentReconciliationWatch({
@@ -1115,23 +1239,33 @@ async function renderPayment() {
         initialResult: { status: 'unavailable', ambiguous: true },
       });
     }
-    renderPaymentUnavailable(error?.shortMessage || error?.message || 'The invoice could not be read from Arc Testnet.', selected.merchant, selected.invoiceId);
+    renderPaymentUnavailable(error?.shortMessage || error?.message || `The invoice could not be read from ${networkName}.`, selected.merchant, selected.invoiceId);
   }
 }
 
 async function payInvoice(merchant, invoiceId, amount) {
   const button = $('#pay-onchain');
-  return runPaymentSubmissionIfIdle(async () => {
+  const run = () => runPaymentSubmissionIfIdle(async () => {
     if (getUncertainPaymentAttempt(merchant, invoiceId)) {
       showToast('A previous payment result is still uncertain. Close any Privy error popup with X—do not tap “Retry transaction” or approve again. Check status; no second transaction was submitted.');
       await renderPayment();
       return;
     }
     if (button) button.disabled = true;
-    let account = activeWalletAddress;
+    let submission;
     try {
+      if (chain?.testnet === false && window.arusPayCurrentPrivyUserId) {
+        const result = await metadataApi.getPaymentAttempt(merchant, invoiceId).catch((cause) => {
+          throw new Error('Termul could not check for a previous Mainnet payment. Check payment status again before paying.', { cause });
+        });
+        if (hydrateUncertainPaymentAttempt(merchant, invoiceId, result?.attempt)) {
+          await renderPayment();
+          return;
+        }
+      }
       const wallet = await getWallet();
-      account = wallet.account;
+      const { account } = wallet;
+      submission = { privyUserId: wallet.privyUserId || null, started: false };
       const current = await getOnchainInvoice(merchant, invoiceId);
       if (current.status !== STATUS.open) throw new Error(`This invoice is ${statusText(current.status, current.expiresAt).toLowerCase()} and cannot be paid.`);
       if (current.expiresAt !== 0n && current.expiresAt <= BigInt(Math.floor(Date.now() / 1000))) throw new Error('This invoice has expired.');
@@ -1139,39 +1273,11 @@ async function payInvoice(merchant, invoiceId, amount) {
       const fee = await estimateFee('payInvoice', [getAddress(merchant), invoiceId], account, current.amount);
       showToast(`Review wallet confirmation for ${formatUsdc(amount)} USDC plus an estimated ${formatUsdc(fee.fee)} USDC network fee.`);
       const attempt = await submitPaymentOnce({
-        submit: async () => {
-          if (!['privy', 'privy-v2'].includes(activeWalletType)) {
-            return wallet.walletClient.writeContract({
-              account,
-              address: CONTRACT_ADDRESS,
-              abi: invoiceAbi,
-              functionName: 'payInvoice',
-              args: [getAddress(merchant), invoiceId],
-              value: current.amount,
-            });
-          }
-          const preparedTransaction = await publicClient.prepareTransactionRequest({
-            account,
-            chain: arcTestnet,
-            chainId: ARC_TESTNET_ID,
-            to: CONTRACT_ADDRESS,
-            data: encodeFunctionData({
-              abi: invoiceAbi,
-              functionName: 'payInvoice',
-              args: [getAddress(merchant), invoiceId],
-            }),
-            value: current.amount,
-          });
-          const serializedTransaction = await wallet.walletClient.signTransaction({
-            ...preparedTransaction,
-            account,
-            chain: arcTestnet,
-          });
-          return broadcastSignedTransactionOnce({
-            serializedTransaction,
-            broadcast: (serialized) => rawTransactionClient.sendRawTransaction({ serializedTransaction: serialized }),
-          });
-        },
+        submit: () => sendInvoiceTransaction(wallet, 'payInvoice', [getAddress(merchant), invoiceId], current.amount, fee,
+          (hash) => {
+            setUncertainPaymentAttempt(merchant, invoiceId, account, hash, current.amount, submission);
+            submission.started = true;
+          }),
         waitForReceipt: (hash) => publicClient.waitForTransactionReceipt({ hash, timeout: 45000, pollingInterval: 1500 }),
         reconcile: ({ transactionHash, receiptHint, error }) => reconcileOnchainPayment({
           merchant,
@@ -1183,6 +1289,7 @@ async function payInvoice(merchant, invoiceId, amount) {
           error,
         }),
       });
+      if (submission.privyUserId !== (window.arusPayCurrentPrivyUserId || null)) return;
       const outcome = attempt.result;
       if (outcome.status === 'paid') {
         if (outcome.contractStatePending || (outcome.proofUnavailable && !outcome.paymentTxHash)) {
@@ -1190,7 +1297,7 @@ async function payInvoice(merchant, invoiceId, amount) {
         } else {
           clearUncertainPaymentAttempt(merchant, invoiceId);
         }
-        window.arusPayApi?.updateInvoice(invoiceId, {
+        window.arusPayApi?.updateInvoice(merchant, invoiceId, {
           status: 'paid',
           ...(outcome.payer ? { payer: outcome.payer } : {}),
           ...(outcome.paymentTxHash ? {
@@ -1241,54 +1348,29 @@ async function payInvoice(merchant, invoiceId, amount) {
             : 'The result is not yet conclusive. No second payment was submitted; check wallet activity and contract status before deciding what to do.');
       }
     } catch (error) {
-      const outcome = await reconcileOnchainPayment({ merchant, invoiceId, amount, payer: account, error });
-      if (outcome.status === 'paid') {
-        if (outcome.contractStatePending || (outcome.proofUnavailable && !outcome.paymentTxHash)) {
-          setUncertainPaymentAttempt(merchant, invoiceId, account, outcome.paymentTxHash, amount);
-        } else {
-          clearUncertainPaymentAttempt(merchant, invoiceId);
-        }
-        window.arusPayApi?.updateInvoice(invoiceId, {
-          status: 'paid',
-          ...(outcome.payer ? { payer: outcome.payer } : {}),
-          ...(outcome.paymentTxHash ? {
-            paymentTxHash: outcome.paymentTxHash,
-            paymentExplorerUrl: `${EXPLORER}/tx/${outcome.paymentTxHash}`,
-          } : {}),
-          onchainVerified: true,
-        });
-        await renderPayment();
-        showToast(outcome.contractStatePending
-          ? 'A matching InvoicePaid event and successful receipt confirm payment. The RPC contract-state read is catching up; no second payment is available.'
-          : outcome.paymentTxHash
-          ? `The contract confirms Paid. Verified transaction: ${outcome.paymentTxHash}`
-          : 'The contract confirms Paid. Its payment receipt is not available yet; check status again for the exact hash.');
-      } else if (outcome.status === 'pending') {
-        setUncertainPaymentAttempt(merchant, invoiceId, account, outcome.paymentTxHash, amount);
-        await renderPayment();
-        showToast('A matching transaction is pending. No additional payment was submitted.');
-      } else if (outcome.status === 'unavailable' || ['inconsistent', 'unmatched'].includes(outcome.status)
-        || outcome.ambiguous || isAmbiguousPaymentError(error)) {
-        setUncertainPaymentAttempt(merchant, invoiceId, account, outcome.paymentTxHash, amount);
-        await renderPayment();
-        showToast('Privy returned an ambiguous wallet or nonce message; it does not prove payment failed. Termul is checking the contract and payment events. No second payment was submitted.');
-      } else if (outcome.status === 'not-open') {
-        clearUncertainPaymentAttempt(merchant, invoiceId);
-        await renderPayment();
-        showToast(`The contract reports ${statusText(outcome.invoice.status, outcome.invoice.expiresAt)}. No second payment was submitted.`);
-      } else {
-        clearUncertainPaymentAttempt(merchant, invoiceId);
-        await renderPayment();
-        showToast(`The contract reports ${statusText(outcome.invoice.status, outcome.invoice.expiresAt)}. No payment is confirmed: ${error?.shortMessage || error?.message || 'review the invoice state'}`);
-      }
+      showToast(error?.shortMessage || error?.message || 'Could not confirm this payment. Check the current invoice status.');
+      await renderPayment();
     } finally {
       if (button?.isConnected) button.disabled = false;
     }
   });
+  const locks = window.navigator.locks;
+  if (chain?.testnet === false && locks) {
+    return locks.request('termul.pay:' + paymentAttemptKey(merchant, invoiceId), { ifAvailable: true }, (lock) => {
+      if (lock) return run();
+      showToast('A payment for this invoice is already open in another tab.');
+    });
+  }
+  return run();
 }
 
 function openSharedInvoice(merchant, invoiceId) {
   try {
+    validatePaymentLinkNetwork(new URL(window.location.href).searchParams, arcNetwork);
+    const params = new URL(window.location.href).searchParams;
+    if (params.getAll('merchant').length !== 1 || params.getAll('invoiceId').length !== 1) {
+      throw new Error('This payment link contains duplicate invoice parameters.');
+    }
     const safeMerchant = getAddress(merchant);
     if (!/^0x[0-9a-fA-F]{64}$/.test(invoiceId)) throw new Error('The payment link has an invalid invoice ID.');
     const id = `INV-${invoiceId.slice(2, 10).toUpperCase()}`;
@@ -1301,7 +1383,8 @@ function openSharedInvoice(merchant, invoiceId) {
     $('#signin').classList.add('hidden');
     $('#workspace').classList.add('hidden');
     $('#payment').classList.remove('hidden');
-    renderPaymentUnavailable(error?.shortMessage || error?.message || 'This payment link could not be read from Arc Testnet.', merchant, invoiceId);
+    sharedLinkError = error?.message || `This payment link could not be read from ${networkName}.`;
+    renderPaymentUnavailable(sharedLinkError, merchant, invoiceId);
   }
 }
 
@@ -1384,7 +1467,7 @@ function createWalletDiagnosticsPanel(diagnostics) {
   panel.append(text);
 
   const nextStep = document.createElement('p');
-  nextStep.textContent = walletDiagnosticsNextStep(diagnostics);
+  nextStep.textContent = walletDiagnosticsNextStep(diagnostics, chain);
   panel.append(nextStep);
 
   const copy = document.createElement('button');
@@ -1453,8 +1536,8 @@ async function checkActiveWalletProvider(address = activeWalletAddress, walletCl
       throw new Error('The wallet provider did not return a valid chain ID.');
     }
     activeWalletChainId = chainId.toLowerCase();
-    if (!isExpectedHexChainId(chainId, ARC_TESTNET_ID)) {
-      throw new Error('The connected wallet is not on Arc Testnet.');
+    if (!isExpectedHexChainId(chainId, CHAIN_ID)) {
+      throw new Error(`The connected wallet is not on ${networkName}.`);
     }
     if (request !== walletProviderProbeRequest || activeWalletAddress?.toLowerCase() !== expectedAddress) return false;
     activeWalletProviderReady = true;
@@ -1476,13 +1559,13 @@ async function checkActiveWalletProvider(address = activeWalletAddress, walletCl
     };
     const diagnostics = window.arusPayPrivy?.getRuntimeDiagnostics?.(diagnosticArgs)
       || createSafeWalletDiagnostics(diagnosticArgs);
-    const nextStep = walletDiagnosticsNextStep(diagnostics);
+    const nextStep = walletDiagnosticsNextStep(diagnostics, chain);
     if (error?.message === 'Privy provider lookup timed out.') {
       activeWalletProviderError = `Privy did not return a wallet provider within 12 seconds. ${nextStep} No signature or transaction was requested.`;
     } else if (error?.message === 'Privy read-only connection check timed out.') {
       activeWalletProviderError = `The wallet provider did not answer the read-only eth_chainId check within 12 seconds. ${nextStep} No signature or transaction was requested.`;
-    } else if (error?.message === 'The connected wallet is not on Arc Testnet.') {
-      activeWalletProviderError = `The selected wallet is not on Arc Testnet. ${nextStep} No signature or transaction was requested.`;
+    } else if (error?.message === `The connected wallet is not on ${networkName}.`) {
+      activeWalletProviderError = `The selected wallet is not on ${networkName}. ${nextStep} No signature or transaction was requested.`;
     } else if (error?.message === 'The wallet provider did not return a valid chain ID.') {
       activeWalletProviderError = `The wallet provider returned an invalid eth_chainId value. ${nextStep} No signature or transaction was requested.`;
     } else if (activeEthereumProviderLookupState === 'rejected') {
@@ -1504,12 +1587,13 @@ async function refreshArcDashboard(address = activeWalletAddress) {
   const request = ++dashboardSyncRequest;
   const refreshButtons = [$('#refresh-chain-sync'), $('#profile-refresh-chain-sync')].filter(Boolean);
   refreshButtons.forEach((button) => { button.disabled = true; });
-  setWalletBalance('—', 'Reading Arc Testnet…');
-  setInvoiceSyncStatus('Syncing invoice events from Arc Testnet…');
+  setWalletBalance('—', `Reading ${networkName}…`);
+  setInvoiceSyncStatus(`Syncing invoice events from ${networkName}…`);
   window.arusPayApi?.setInvoiceSyncState('loading');
 
-  const verifiedChain = publicClient.getChainId().then((chainId) => {
-    if (chainId !== ARC_TESTNET_ID) throw new Error('The RPC endpoint returned an unexpected chain ID.');
+  const verifiedChain = Promise.resolve().then(async () => {
+    if (arcNetwork.error) throw new Error(arcNetwork.error);
+    if (await publicClient.getChainId() !== CHAIN_ID) throw new Error('The RPC endpoint returned an unexpected chain ID.');
   });
   const [balanceResult, invoicesResult] = await Promise.allSettled([
     verifiedChain.then(() => publicClient.getBalance({ address: safeAddress })),
@@ -1518,9 +1602,9 @@ async function refreshArcDashboard(address = activeWalletAddress) {
   if (request !== dashboardSyncRequest) return;
 
   if (balanceResult.status === 'fulfilled') {
-    setWalletBalance(formatUsdc(balanceResult.value), 'Native USDC balance · Arc Testnet');
+    setWalletBalance(formatUsdc(balanceResult.value), `Native USDC balance · ${networkName}`);
   } else {
-    const message = balanceResult.reason?.shortMessage || balanceResult.reason?.message || 'Arc Testnet balance could not be read.';
+    const message = balanceResult.reason?.shortMessage || balanceResult.reason?.message || `${networkName} balance could not be read.`;
     setWalletBalance('—', 'Balance unavailable · refresh to retry', message);
   }
 
@@ -1528,13 +1612,13 @@ async function refreshArcDashboard(address = activeWalletAddress) {
     const syncedInvoices = invoicesResult.value;
     window.arusPayApi?.replaceInvoices(syncedInvoices);
     const syncMessage = syncedInvoices.length
-      ? `${syncedInvoices.length} invoice${syncedInvoices.length === 1 ? '' : 's'} synced from Arc Testnet.`
-      : 'No invoice events found for this wallet on Arc Testnet.';
+      ? `${syncedInvoices.length} invoice${syncedInvoices.length === 1 ? '' : 's'} synced from ${networkName}.`
+      : `No invoice events found for this wallet on ${networkName}.`;
     setInvoiceSyncStatus(metadataSyncUnavailable
       ? `${syncMessage} Supabase metadata is unavailable; showing contract details only.`
       : syncMessage);
   } else {
-    const message = invoicesResult.reason?.shortMessage || invoicesResult.reason?.message || 'Arc Testnet invoices could not be read.';
+    const message = invoicesResult.reason?.shortMessage || invoicesResult.reason?.message || `${networkName} invoices could not be read.`;
     setInvoiceSyncStatus('Invoice sync unavailable · refresh to retry', message);
     window.arusPayApi?.setInvoiceSyncState('error');
   }
@@ -1611,14 +1695,29 @@ window.arusPayWalletChanged = (wallets = []) => {
   }
 };
 
+window.arusPayConfig = Object.freeze({
+  chainId: CHAIN_ID,
+  networkName,
+  rpcUrl: ARC_RPC,
+  contractAddress: CONTRACT_ADDRESS,
+  explorerUrl: EXPLORER,
+});
+$$('[data-arc-name]').forEach((label) => { label.textContent = networkName; });
+const environment = $('[data-arc-environment]');
+if (environment && !chain?.testnet) environment.textContent = arcNetwork.error || networkName;
+if (arcNetwork.error) {
+  const submit = $('#invoice-form [type="submit"]');
+  if (submit) {
+    submit.disabled = true;
+    const message = document.createElement('p');
+    message.className = 'hint';
+    message.setAttribute('role', 'status');
+    message.textContent = arcNetwork.error;
+    submit.after(message);
+  }
+}
+
 const url = new URL(window.location.href);
 const linkedMerchant = url.searchParams.get('merchant');
 const linkedInvoice = url.searchParams.get('invoiceId');
 if (linkedMerchant && linkedInvoice) openSharedInvoice(linkedMerchant, linkedInvoice);
-
-window.arusPayConfig = {
-  chainId: ARC_TESTNET_ID,
-  rpcUrl: ARC_RPC,
-  contractAddress: CONTRACT_ADDRESS,
-  explorerUrl: EXPLORER,
-};

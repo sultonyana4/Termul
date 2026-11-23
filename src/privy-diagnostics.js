@@ -1,3 +1,5 @@
+import { ARC_TESTNET } from '../supabase/functions/_shared/arc-networks.js';
+
 const EVM_CHAIN_TYPES = new Set(['ethereum', 'evm']);
 const EVM_ADDRESS = /^0x[0-9a-fA-F]{40}$/;
 
@@ -22,7 +24,6 @@ const SAFE_WALLET_LABELS = new Set([
   'Other EVM wallet',
   'Unknown EVM wallet',
 ]);
-const ARC_TESTNET_CHAIN_ID = '0x4cef52';
 
 export function isEvmConnectedWallet(wallet) {
   const walletType = wallet?.type;
@@ -133,7 +134,7 @@ export function formatSafeWalletDiagnostics(diagnostics) {
   ].join('\n');
 }
 
-export function walletDiagnosticsNextStep(diagnostics) {
+export function walletDiagnosticsNextStep(diagnostics, chain = ARC_TESTNET) {
   const safe = normalizeWalletDiagnostics(diagnostics);
   if (!safe.privySessionReady) {
     return 'Keep this page open until the Privy session finishes loading, then copy and send the safe diagnostics below. Do not repeat Retry.';
@@ -147,8 +148,8 @@ export function walletDiagnosticsNextStep(diagnostics) {
   if (safe.connectedEvmWalletCount === 0) {
     return 'Privy currently exposes no connected EVM wallet. Reopen/connect the EVM wallet in Privy, then copy and send the safe diagnostics below.';
   }
-  if (safe.ethChainId !== 'unavailable' && safe.ethChainId !== ARC_TESTNET_CHAIN_ID) {
-    return 'Switch the selected wallet to Arc Testnet, then copy and send the safe diagnostics below. This read-only check does not test signing.';
+  if (safe.ethChainId !== 'unavailable' && chain && safe.ethChainId !== `0x${chain.id.toString(16)}`) {
+    return `Switch the selected wallet to ${chain.name}, then copy and send the safe diagnostics below. This read-only check does not test signing.`;
   }
   if (safe.getEthereumProvider === 'rejected') {
     return 'Privy rejected the provider lookup. Copy and send the safe diagnostics below; there is no need to repeat Retry.';

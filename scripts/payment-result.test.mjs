@@ -443,4 +443,41 @@ const commonDeps = {
   }
 }
 
+{
+  const result = await reconcilePaymentAttempt({
+    expected,
+    transactionHash: hash,
+    ...commonDeps,
+    readInvoice: async () => onchainInvoice(1),
+    readReceipt: async () => ({ ...successfulReceipt, transactionHash: '0x' + 'fe'.repeat(32) }),
+  });
+  assert.notEqual(result.status, 'paid', 'An event wrapped in a receipt for a different hash cannot prove payment.');
+}
+
+for (const log of [
+  { ...paidLog, removed: true },
+  { ...paidLog, transactionHash: '0x' + 'ad'.repeat(32) },
+]) {
+  const result = await reconcilePaymentAttempt({
+    expected,
+    transactionHash: hash,
+    ...commonDeps,
+    readInvoice: async () => onchainInvoice(1),
+    readReceipt: async () => ({ ...successfulReceipt, logs: [log] }),
+  });
+  assert.equal(result.status, 'unmatched');
+}
+
+{
+  let reads = 0;
+  const result = await reconcilePaymentAttempt({
+    expected,
+    transactionHash: hash,
+    ...commonDeps,
+    findPaymentLogs: async () => [],
+    readInvoice: async () => onchainInvoice(++reads === 1 ? 1 : 3),
+  });
+  assert.equal(result.status, 'inconsistent');
+}
+
 console.log('Payment-result regression tests passed (mocked wallet/RPC only; no real wallet, RPC, or transaction submission).');

@@ -33,12 +33,12 @@ export async function broadcastSignedTransactionOnce({ serializedTransaction, br
   try {
     const returnedHash = await broadcast(serializedTransaction);
     if (typeof returnedHash !== 'string' || returnedHash.toLowerCase() !== transactionHash.toLowerCase()) {
-      throw new Error('Arc Testnet RPC returned a transaction hash that does not match the signed transaction.');
+      throw new Error('Arc RPC returned a transaction hash that does not match the signed transaction.');
     }
     return transactionHash;
   } catch (cause) {
     const error = Object.assign(
-      new Error(cause?.shortMessage || cause?.message || 'Arc Testnet transaction broadcast failed.'),
+      new Error(cause?.shortMessage || cause?.message || 'Arc transaction broadcast failed.'),
       { cause, transactionHash },
     );
     throw error;
@@ -112,11 +112,12 @@ export function matchesPaymentTransaction(transaction, expected, payer = expecte
   }
 }
 
-function matchingPaymentEvent(logs, expected, payer) {
+function matchingPaymentEvent(logs, expected, payer, transactionHash) {
   if (!Array.isArray(logs)) return null;
   for (const log of logs) {
     try {
-      if (getAddress(log.address) !== getAddress(expected.contract)) continue;
+      if (log.removed || (log.transactionHash && log.transactionHash.toLowerCase() !== transactionHash.toLowerCase())
+        || getAddress(log.address) !== getAddress(expected.contract)) continue;
       const decoded = decodeEventLog({ abi: expected.abi, eventName: 'InvoicePaid', data: log.data, topics: log.topics });
       const args = decoded.args;
       if (args.invoiceId.toLowerCase() !== expected.invoiceId.toLowerCase()
@@ -131,22 +132,6 @@ function matchingPaymentEvent(logs, expected, payer) {
   return null;
 }
 
-function matchingEventLog(logs, expected, args) {
-  if (!Array.isArray(logs)) return false;
-  return logs.some((log) => {
-    try {
-      if (getAddress(log.address) !== getAddress(expected.contract)) return false;
-      const decoded = decodeEventLog({ abi: expected.abi, eventName: 'InvoicePaid', data: log.data, topics: log.topics });
-      return decoded.args.invoiceId.toLowerCase() === expected.invoiceId.toLowerCase()
-        && getAddress(decoded.args.merchant) === getAddress(expected.merchant)
-        && getAddress(decoded.args.payer) === getAddress(args.payer)
-        && BigInt(decoded.args.amount) === BigInt(expected.amount);
-    } catch {
-      return false;
-    }
-  });
-}
-
 function invoiceHasExpectedIdentity(invoice, expected) {
   return invoice && getAddress(invoice.merchant) === getAddress(expected.merchant)
     && BigInt(invoice.amount) === BigInt(expected.amount);
@@ -154,7 +139,7 @@ function invoiceHasExpectedIdentity(invoice, expected) {
 
 async function proveEventPayment(log, expected, deps, receiptHint = null) {
   const args = log?.args;
-  if (!args || !log.transactionHash
+  if (!args || log.removed || !log.transactionHash
     || args.invoiceId?.toLowerCase() !== expected.invoiceId.toLowerCase()
     || getAddress(args.merchant) !== getAddress(expected.merchant)
     || BigInt(args.amount) !== BigInt(expected.amount)) return null;
@@ -165,12 +150,13 @@ async function proveEventPayment(log, expected, deps, receiptHint = null) {
   if (!receipt) {
     try { receipt = await deps.readReceipt(log.transactionHash); } catch { return null; }
   }
-  if (receipt?.status !== 'success' || !matchingEventLog(receipt.logs, expected, args)) return null;
+  if (receipt?.status !== 'success' || receipt.transactionHash?.toLowerCase() !== log.transactionHash.toLowerCase()
+    || !matchingPaymentEvent(receipt.logs, expected, args.payer, log.transactionHash)) return null;
 
   let transaction;
   try { transaction = await deps.readTransaction(log.transactionHash); } catch { return null; }
   if (!matchesPaymentTransaction(transaction, expected, args.payer)) return null;
-  if (transaction.hash && transaction.hash.toLowerCase() !== log.transactionHash.toLowerCase()) return null;
+  if (transaction.hash?.toLowerCase() !== log.transactionHash.toLowerCase()) return null;
 
   return {
     status: 'paid',
@@ -245,15 +231,16 @@ export async function reconcilePaymentAttempt({
     try { receipt = await readReceipt(transactionHash); } catch { receipt = null; }
   }
 
-  if (transactionHash && receipt) {
+  if (transactionHash && receipt?.transactionHash?.toLowerCase() === transactionHash.toLowerCase()) {
     let transaction;
     try { transaction = await readTransaction(transactionHash); } catch { transaction = null; }
-    const validTransaction = matchesPaymentTransaction(transaction, expected);
+    const validTransaction = transaction?.hash?.toLowerCase() === transactionHash.toLowerCase()
+      && matchesPaymentTransaction(transaction, expected);
     if (validTransaction && receipt.status === 'reverted') {
       return { status: 'reverted', invoice, paymentTxHash: transactionHash, payer: getAddress(expected.payer), proofUnavailable: false, ambiguous: false };
     }
     if (validTransaction && receipt.status === 'success'
-      && matchingPaymentEvent(receipt.logs, expected, expected.payer)) {
+      && matchingPaymentEvent(receipt.logs, expected, expected.payer, transactionHash)) {
       let refreshed;
       try { refreshed = await readInvoice(); } catch {
         return { status: 'unavailable', invoice, paymentTxHash: transactionHash, payer: getAddress(expected.payer), reason: 'post-receipt-contract-read-failed', ambiguous: true };
@@ -263,6 +250,9 @@ export async function reconcilePaymentAttempt({
       }
       if (Number(refreshed.status) === paidStatus) {
         return { status: 'paid', invoice: refreshed, paymentTxHash: transactionHash, payer: getAddress(expected.payer), payerMatchesExpected: true, receiptStatus: 'success', proofUnavailable: false, ambiguous };
+      }
+      if (Number(refreshed.status) !== openStatus) {
+        return { status: 'inconsistent', invoice: refreshed, paymentTxHash: null, reason: 'contradictory-contract-status', ambiguous: true };
       }
       return {
         status: 'paid',

@@ -35,7 +35,7 @@ function matchingInvoiceCreatedEvent(logs, expected, transactionHash) {
   if (!Array.isArray(logs)) return false;
   return logs.some((log) => {
     try {
-      if (getAddress(log.address) !== getAddress(expected.contract)) return false;
+      if (log.removed || getAddress(log.address) !== getAddress(expected.contract)) return false;
       if (log.transactionHash && !sameHex(log.transactionHash, transactionHash)) return false;
       const decoded = decodeEventLog({
         abi: expected.abi,
@@ -82,17 +82,17 @@ export async function reconcileInvoiceCreationAttempt({
   }
 
   let receipt = receiptHint;
-  if (receipt && receipt.transactionHash && !sameHex(receipt.transactionHash, transactionHash)) receipt = null;
+  if (receipt && !sameHex(receipt.transactionHash, transactionHash)) receipt = null;
   if (!receipt) {
     try { receipt = await readReceipt(transactionHash); } catch { receipt = null; }
   }
-  if (receipt?.transactionHash && !sameHex(receipt.transactionHash, transactionHash)) {
+  if (receipt && !sameHex(receipt.transactionHash, transactionHash)) {
     return { status: 'unmatched', transactionHash, ambiguous: true, reason: 'receipt-hash-mismatch' };
   }
 
   let transaction = null;
   try { transaction = await readTransaction(transactionHash); } catch { transaction = null; }
-  if (transaction?.hash && !sameHex(transaction.hash, transactionHash)) {
+  if (transaction && !sameHex(transaction.hash, transactionHash)) {
     return { status: 'unmatched', transactionHash, ambiguous: true, reason: 'transaction-hash-mismatch' };
   }
   if (!transaction) return { status: 'pending', transactionHash, ambiguous: true };
