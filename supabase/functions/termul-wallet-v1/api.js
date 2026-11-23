@@ -155,6 +155,31 @@ export function walletApi({ db, createSiweMessage, parseSiweMessage, verifyEOA, 
           expiresAt: new Date(now() + 12 * 60_000).toISOString() }, true);
       }
 
+      // Payment links are deliberately shareable: disclose only the intended
+      // display fields for one exact mainnet invoice, never client_email or profiles.
+      // No merchant session is required to VIEW these fields. All writes still
+      // require a verified wallet session below.
+      if (action === 'public_invoice') {
+        if (input.chainId !== deployment.id || typeof input.contractAddress !== 'string'
+          || input.contractAddress.toLowerCase() !== deployment.contractAddress) {
+          fail(400, 'Unsupported invoice deployment.');
+        }
+        const merchant = address(input.merchantAddress);
+        const invoiceId = hex32(input.invoiceId);
+        await limited('public-invoice:global', 600);
+        await limited('public-invoice:' + merchant + ':' + invoiceId, 60);
+        const key = { ...SCOPED, merchant_address: merchant, invoice_id: invoiceId };
+        const [legacy, current] = await Promise.all([
+          db.read('termul_mainnet_invoices', key, 'client_name,description', 1),
+          db.read('termul_wallet_invoices', key, 'client_name,description', 1),
+        ]);
+        const row = legacy[0] || current[0];
+        return response(200, { invoice: row ? {
+          clientName: String(row.client_name || '').slice(0, 120),
+          description: String(row.description || '').slice(0, 1000),
+        } : null }, true);
+      }
+
       await limited('session:global', 1000);
       const session = await sessionFor(request, input);
       const wallet = session.wallet_address;

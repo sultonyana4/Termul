@@ -13,7 +13,7 @@ const signature = '0x' + '11'.repeat(65);
 const scope = { chainId: 5042, contractAddress: net.contractAddress, merchantAddress: merchant, invoiceId };
 const legacy = {
   chain_id: 5042, contract_address: net.contractAddress, merchant_address: merchant, invoice_id: invoiceId,
-  client_name: 'Original merchant metadata', amount_native: '10000000000000001', created_at: '2026-11-20T00:00:00Z',
+  client_name: 'Original merchant metadata', client_email: 'secret@test.invalid', description: 'Legacy services', amount_native: '10000000000000001', created_at: '2026-11-20T00:00:00Z',
 };
 let now = Date.parse('2026-11-23T00:00:00Z');
 let expectedSigner = merchant;
@@ -80,6 +80,17 @@ const challenge = async (walletAddress = merchant) => {
 };
 const verify = (c, changes = {}) => call('verify', { ...c, signature, ...changes });
 assert.equal((await call('challenge', { walletAddress: merchant }, null, 'https://test.termul.xyz')).status, 403);
+// Public payment links may show only exact-invoice display fields, not email.
+const publicOriginal = await call('public_invoice', scope);
+assert.equal(publicOriginal.status, 200);
+assert.deepEqual(publicOriginal.data.invoice, {
+  clientName: 'Original merchant metadata', description: 'Legacy services',
+});
+assert.equal(JSON.stringify(publicOriginal.data).includes('secret@test.invalid'), false);
+assert.equal((await call('public_invoice', { ...scope, chainId: 1 })).status, 400);
+assert.equal((await call('public_invoice', { ...scope, contractAddress: payer })).status, 400);
+assert.equal((await call('public_invoice', { ...scope, merchantAddress: payer })).data.invoice, null);
+assert.equal((await call('public_invoice', { ...scope, invoiceId: hash })).data.invoice, null);
 const first = await challenge();
 assert.equal(parseSiweMessage(first.message).chainId, 5042);
 assert.notEqual((await challenge()).message, first.message);
@@ -106,6 +117,9 @@ const write = { ...asMerchant, invoiceId: hash, createTxHash: hash, amountNative
 assert.equal((await call('save_invoice', { ...write, merchantAddress: payer }, merchantToken)).status, 403);
 assert.equal((await call('save_invoice', { ...write, amountNative: '100' }, merchantToken)).status, 422);
 assert.equal((await call('save_invoice', write, merchantToken)).data.invoice.amount_native, legacy.amount_native);
+assert.deepEqual((await call('public_invoice', { ...scope, invoiceId: hash })).data.invoice, {
+  clientName: 'Client', description: 'Work',
+});
 assert.equal((await call('save_invoice', { ...write, invoiceId }, merchantToken)).data.invoice.client_name, legacy.client_name);
 assert.deepEqual(rows('termul_mainnet_invoices'), [legacy]);
 assert.equal((await call('save_profile', { walletAddress: merchant, displayName: 'Merchant' }, merchantToken)).status, 200);
