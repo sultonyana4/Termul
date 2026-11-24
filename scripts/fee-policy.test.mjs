@@ -27,7 +27,7 @@ const checks = new Set();
 const noStore = { 'Cache-Control': 'no-store' };
 const preview = 'https://termul-preview.vercel.app';
 const reply = (value, options = {}) => Response.json(value, { ...options, headers: { ...noStore, ...options.headers } });
-function mock({ staticPolicy = on, livePolicy = staticPolicy, staleCheck, staticReply, liveReply } = {}) {
+function mock({ staticPolicy = on, livePolicy = staticPolicy, staleCheck, staticReply, liveReply, liveHeaders } = {}) {
   return async (path, options) => {
     const url = new URL(path, FEE_POLICY_ORIGIN);
     const check = url.searchParams.get('check');
@@ -43,9 +43,14 @@ function mock({ staticPolicy = on, livePolicy = staticPolicy, staleCheck, static
     }
     assert.equal(url.pathname, FEE_POLICY_CHECK);
     assert.ok(checks.has(check));
-    return liveReply ?? reply({ check: staleCheck ?? check, policy: serializeFeePolicy(livePolicy) });
+    return liveReply ?? reply({ check: staleCheck ?? check, policy: serializeFeePolicy(livePolicy) }, { headers: liveHeaders });
   };
 }
+// Vercel can serve the static manifest with HIT/Age even when no-store is set.
+// Only the matching nonce-bound dynamic API must be uncached.
+await assertCurrentFeePolicy(on, () => loadFeePolicy(mock({ staticReply: reply(asset, {
+  headers: { Age: '105', 'x-vercel-cache': 'HIT' },
+}) }), FEE_POLICY_ORIGIN));
 await assertCurrentFeePolicy(on, () => loadFeePolicy(mock(), FEE_POLICY_ORIGIN));
 await assertCurrentFeePolicy(on, () => loadFeePolicy(mock(), FEE_POLICY_ORIGIN));
 await assert.rejects(assertCurrentFeePolicy(on, () => loadFeePolicy(mock({ staticPolicy: rollback }), FEE_POLICY_ORIGIN)), /fee policy changed/);
@@ -59,8 +64,7 @@ for (const options of [
   { staticReply: Response.redirect(FEE_POLICY_ORIGIN + '/') }, { staticReply: new Response(null, { status: 404 }) }, { liveReply: new Response(null, { status: 503 }) },
   { staticReply: reply({ ...asset, bps: 25 }) }, { staticReply: new Response('<html>', { headers: noStore }) },
   { staticReply: Response.json(asset) }, { staticReply: reply(asset, { status: 206 }) },
-  { staticReply: reply(asset, { headers: { Age: '5' } }) },
-  { staticReply: reply(asset, { headers: { 'x-vercel-cache': 'HIT' } }) },
+  { liveHeaders: { Age: '105', 'x-vercel-cache': 'HIT' } },
   { liveReply: reply({ policy: asset }, { headers: { 'x-vercel-cache': 'STALE' } }) },
 ]) {
   await assert.rejects(loadFeePolicy(mock(options), FEE_POLICY_ORIGIN), /Could not verify/);

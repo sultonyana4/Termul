@@ -38,19 +38,19 @@ export async function loadFeePolicy(fetcher = fetch, origin = globalThis.locatio
     const options = {
       cache: 'no-store', mode: 'same-origin', credentials: 'omit', redirect: 'error', signal: AbortSignal.timeout(5000),
     };
-    async function read(path) {
+    async function read(path, requireFresh = true) {
       const response = await fetcher(path + '?check=' + check, options);
       const cache = response.headers.get('x-vercel-cache')?.trim();
       const age = response.headers.get('age')?.trim();
       if (response.status !== 200 || response.redirected
         || !/^application\/json(?:\s*;|$)/i.test(response.headers.get('content-type') ?? '')
         || !/(?:^|,)\s*no-store\s*(?:,|$)/i.test(response.headers.get('cache-control') ?? '')
-        || (age && age !== '0') || (cache && !/^(?:MISS|BYPASS|REVALIDATED)$/i.test(cache))) {
+        || (requireFresh && ((age && age !== '0') || (cache && !/^(?:MISS|BYPASS|REVALIDATED)$/i.test(cache))))) {
         throw new Error('Unexpected fee policy response.');
       }
       return response.json();
     }
-    const [manifest, live] = await Promise.all([read('/' + FEE_POLICY_FILE), read(FEE_POLICY_CHECK)]);
+    const [manifest, live] = await Promise.all([read('/' + FEE_POLICY_FILE, false), read(FEE_POLICY_CHECK)]);
     const policy = parseFeePolicy(manifest);
     if (live?.check !== check || Object.keys(live).length !== 2 || !sameFeePolicy(policy, parseFeePolicy(live.policy))) throw new Error('Stale fee policy.');
     if (policy.bps && origin !== FEE_POLICY_ORIGIN) throw new Error('Invalid fee origin.');
