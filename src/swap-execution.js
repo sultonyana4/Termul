@@ -187,8 +187,10 @@ export function createSwapExecution({ client, wallet, ledger, deploymentCheck = 
       const swapCall = { to: SWAP_ROUTER, data: quote.data };
       const allowance = () => tokenRead(client, quote.from, 'allowance', [quote.account, SWAP_ROUTER]);
       let approvalHash;
+      // Keep the maximum combined approval + swap network fee inside the reviewed budget.
+      let committedGasBudget = 0n;
 
-      async function send(phase, call, limit, remainingGas = 0n) {
+      async function send(phase, call) {
         assertFreshQuote(quote);
         const [gas, balances, price] = await Promise.all([
           client.estimateGas({ account: quote.account, ...call, value: 0n }),
@@ -196,8 +198,15 @@ export function createSwapExecution({ client, wallet, ledger, deploymentCheck = 
           gasPrice(client),
         ]);
         const bufferedGas = withGasHeadroom(gas);
-        if (bufferedGas > limit || price > review.gasPrice) throw new Error('The network fee changed. Review a new quote.');
-        requireBalance(quote, balances, bufferedGas * price + remainingGas * review.gasPrice);
+        const transactionBudget = bufferedGas * price;
+        const safeGasLimit = phase === 'approval' ? APPROVAL_GAS_LIMIT : MAX_SWAP_GAS_LIMIT;
+        // Re-estimated gas may change after approval, but never exceed the fee limit reviewed by the user.
+        if (bufferedGas > safeGasLimit || committedGasBudget + transactionBudget > review.gasBudget) {
+          throw new Error('The network fee changed beyond your reviewed limit. Review a new quote.');
+        }
+        // Reserve the remaining reviewed budget during approval as well, so a first
+        // signature cannot consume the USDC needed for the subsequent swap.
+        requireBalance(quote, balances, review.gasBudget - committedGasBudget);
         await assertWalletProvider(provider, quote.account);
         await verifyPolicy(quote.feePolicy);
         sameSelection(wallet, selection, quote);
@@ -216,7 +225,10 @@ export function createSwapExecution({ client, wallet, ledger, deploymentCheck = 
             from: quote.account, chainId: numberToHex(arcNetwork.id), ...call, value: '0x0',
             gas: numberToHex(bufferedGas), gasPrice: numberToHex(price),
           }] });
-          if (isHash(hash)) record.hash = hash;
+          if (isHash(hash)) {
+            record.hash = hash;
+            committedGasBudget += transactionBudget;
+          }
         } catch (error) {
           if (error?.code === 4001) {
             ledger.put({ ...record, state: 'done' });
@@ -241,13 +253,13 @@ export function createSwapExecution({ client, wallet, ledger, deploymentCheck = 
 
       if (await allowance() < quote.amount) {
         if (!review.needsApproval) throw new Error('Allowance changed. Review the approval and fee again.');
-        const approved = await send('approval', approvalCall, APPROVAL_GAS_LIMIT, quote.gasLimit);
+        const approved = await send('approval', approvalCall);
         if (approved.status !== 'approved') return approved;
         approvalHash = approved.record.hash;
         onProgress({ stage: 'approved', record: approved.record });
         if (await allowance() < quote.amount) throw new Error('The confirmed approval did not provide the required allowance.');
       }
-      return await send('swap', swapCall, quote.gasLimit);
+      return await send('swap', swapCall);
     } finally {
       busy = false;
     }

@@ -130,6 +130,7 @@ function harness(options = {}) {
   const initial = current;
   let allowance = options.allowance ?? quote.amount;
   const sent = [];
+  let gasReadCount = 0;
   const transactions = new Map();
   const records = new Map();
   const ledger = swapLedger({ getItem: key => records.get(key), setItem: (key, value) => records.set(key, value) });
@@ -157,7 +158,7 @@ function harness(options = {}) {
   };
   const client = {
     getChainId: async () => options.rpcChain ?? 5042,
-    getGasPrice: async () => 20_000_000_000n,
+    getGasPrice: async () => options.gasPrices?.[gasReadCount++] ?? 20_000_000_000n,
     getBalance: async () => options.nativeBalance ?? 100n * 10n ** 18n,
     readContract: async ({ functionName }) => {
       if (functionName === 'balanceOf') return options.balance ?? 100_000_000n;
@@ -167,7 +168,7 @@ function harness(options = {}) {
       assert.fail(functionName);
     },
     getCode: async () => '0x01',
-    estimateGas: async ({ to }) => to === SWAP_ROUTER ? 350_000n : 45_000n,
+    estimateGas: async ({ to }) => to === SWAP_ROUTER ? (options.swapGas ?? 350_000n) : (options.approvalGas ?? 45_000n),
     waitForTransactionReceipt: options.rpcDown ? async () => { throw new Error('RPC timeout'); } : receipt,
     getTransactionReceipt: receipt,
     getTransaction: async ({ hash }) => transactions.get(hash),
@@ -194,6 +195,27 @@ for (const settings of [{}, { context: reverse, allowance: 0n }, { policy: enabl
     assert.deepEqual(decodeFunctionData({ abi: erc20Abi, data: h.sent[0].data }).args, [SWAP_ROUTER, quotedInput]);
     assert.equal(result.record.approvalHash, approvalHash);
   } else assert.equal(h.sent.length, 1);
+}
+
+// Regression: real network gas/estimate can change between an EURC approval and the swap.
+// The approved aggregate network fee remains the hard upper bound; a higher estimate is
+// allowed only when it still fits that bound.
+for (const options of [
+  { gasPrices: [20_000_000_000n, 20_000_000_000n, 30_000_000_000n] },
+  { swapGas: 540_000n }, // buffered estimate 648k > LI.FI quote 600k, but within reviewed fee budget
+]) {
+  const h = harness({ context: reverse, policy: enabledFee, allowance: 0n, ...options });
+  const result = await h.execute(h.quote, await reviewSwap(h.client, h.quote), h.initial);
+  assert.equal(result.status, 'confirmed');
+  assert.equal(h.sent.length, 2);
+}
+for (const options of [
+  { gasPrices: [20_000_000_000n, 20_000_000_000n, 80_000_000_000n] },
+  { swapGas: 3_000_000n }, // buffered 3.6M exceeds hard safety limit
+]) {
+  const h = harness({ context: reverse, policy: enabledFee, allowance: 0n, ...options });
+  await assert.rejects(h.execute(h.quote, await reviewSwap(h.client, h.quote), h.initial), /network fee changed beyond your reviewed limit/i);
+  assert.equal(h.sent.length, 1); // approval only, no swap sent beyond user's reviewed budget
 }
 
 const maxClient = harness({ nativeBalance: 100n * 10n ** 18n }).client;
