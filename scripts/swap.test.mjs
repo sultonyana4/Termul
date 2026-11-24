@@ -1,11 +1,13 @@
+import { assertCurrentFeePolicy } from '../src/fee-policy.js';
 import assert from 'node:assert/strict';
 import { decodeFunctionData, encodeFunctionData, erc20Abi } from 'viem';
+import { swapFee } from '../src/swap-fee.js';
 import { arcNetwork } from '../src/arc-network.js';
 import {
   FEE_ABI, FLY_ABI, SWAP_ABI, SWAP_ROUTER, SWAP_TOKENS, assertFreshQuote, createQuoteRequest, fetchSwapQuote, parseSwapAmount, parseSwapQuote,
 } from '../src/swap-quote.js';
-import { createSwapExecution, reviewSwap, spendableAmount, swapLedger, verifySwapRecord } from '../src/swap-execution.js';
-import { account, actualOutput, approvalHash, quoteFixture, quotedInput, quotedOutput, recordFixture, settlementFixture, swapHash } from './swap-fixtures.mjs';
+import { createSwapExecution, maxSwapAmount, reviewSwap, spendableAmount, swapLedger, verifySwapRecord } from '../src/swap-execution.js';
+import { account, actualOutput, approvalHash, enabledFee, feeRecipient, quoteFixture, quotedInput, quotedOutput, recordFixture, settlementFixture, swapHash } from './swap-fixtures.mjs';
 
 const { USDC, EURC } = SWAP_TOKENS;
 const context = { from: USDC, to: EURC, amount: quotedInput, account };
@@ -67,10 +69,45 @@ const signal = new AbortController().signal;
 await fetchSwapQuote(context, signal, async request => { url = new URL(request); return Response.json(raw); });
 assert.equal(url.origin + url.pathname, 'https://li.quest/v1/quote');
 assert.equal(url.searchParams.get('fee'), '0');
-assert.equal(url.searchParams.get('integrator'), null);
+assert.equal(url.searchParams.get('integrator'), 'termul');
 assert.equal(url.searchParams.get('allowExchanges'), 'fly');
 assert.equal(url.searchParams.get('fromChain'), '5042');
 await assert.rejects(fetchSwapQuote(context, signal, async () => new Response(null, { status: 404 })), /No supported route/);
+
+assert.equal(swapFee.bps, 0);
+for (const pair of [context, reverse]) {
+  const input = { ...pair, amount: quotedInput + 999n, policy: enabledFee };
+  const withFee = quoteFixture(input);
+  const quote = await fetchSwapQuote(input, signal, async (request, init) => {
+    assert.equal(new URL(request).searchParams.get('fee'), '0.001');
+    assert.equal(new URL(request).searchParams.get('integrator'), 'termul');
+    assert.equal(init.headers, undefined);
+    return Response.json(withFee);
+  }, Date.now, enabledFee);
+  assert.equal(quote.amount, quotedInput + 999n);
+  assert.equal(quote.integratorFee, 10_000n);
+  assert.equal(quote.providerFee, 25_002n);
+  for (const mutate of [
+    q => { q.estimate.feeCosts = []; },
+    q => { q.estimate.feeCosts[0].feeSplit.integratorFee = '10001'; },
+    q => { q.estimate.feeCosts[0].feeSplit.integratorFee = '9000'; },
+    q => { q.estimate.feeCosts[0].token = q.action.toToken; },
+    q => { q.estimate.feeCosts[0].included = false; },
+    q => { q.estimate.feeCosts[0].amount = '999999'; },
+    q => { q.estimate.feeCosts[0].feeSplit.intermediaryFee = '1'; },
+    q => { q.estimate.feeCosts.push(q.estimate.feeCosts[0]); },
+    q => { q.distributionFees = [{ receiver: address, percentage: 0.001 }]; },
+    q => { q.transactionRequest.gasLimit = '3000001'; },
+  ]) {
+    const invalid = structuredClone(withFee);
+    mutate(invalid);
+    assert.throws(() => parseSwapQuote(invalid, input, 0, enabledFee));
+  }
+  assert.throws(() => parseSwapQuote(withFee, input, 0, { ...enabledFee, recipient: address }));
+  assert.throws(() => parseSwapQuote(withFee, input, 0, swapFee));
+}
+const tiny = { ...context, amount: 999n, policy: enabledFee };
+assert.throws(() => parseSwapQuote(quoteFixture(tiny), tiny, 0, enabledFee));
 
 const publishes = [];
 const resolvers = new Map();
@@ -88,7 +125,7 @@ assert.deepEqual(publishes.filter(entry => entry.status === 'ready'), [{ status:
 
 function harness(options = {}) {
   const context = options.context || { from: USDC, to: EURC, amount: quotedInput, account };
-  const quote = asQuote(quoteFixture(context), context);
+  const quote = parseSwapQuote(quoteFixture({ ...context, policy: options.policy }), context, Date.now(), options.policy);
   let current = { address: account, chainId: 5042, connectorId: 'fixture', revision: 0 };
   const initial = current;
   let allowance = options.allowance ?? quote.amount;
@@ -135,12 +172,13 @@ function harness(options = {}) {
     getTransactionReceipt: receipt,
     getTransaction: async ({ hash }) => transactions.get(hash),
   };
-  const execute = createSwapExecution({ client, wallet, ledger, deploymentCheck: options.defaultDeployment ? undefined : async () => {} });
+  const execute = createSwapExecution({ client, wallet, ledger, deploymentCheck: options.defaultDeployment ? undefined : async () => {},
+    verifyPolicy: expected => assertCurrentFeePolicy(expected, async () => options.currentPolicy?.() ?? quote.feePolicy) });
   return { quote, initial, client, execute, ledger, sent, swapAccount: newSelection => { current = newSelection; } };
 }
 
 assert.equal(spendableAmount({ native: 1_000_000n * 10n ** 12n, USDC: 1_000_000n }, USDC, 10n ** 17n), 900_000n);
-for (const settings of [{}, { context: reverse, allowance: 0n }]) {
+for (const settings of [{}, { context: reverse, allowance: 0n }, { policy: enabledFee }, { policy: enabledFee, context: reverse, allowance: 0n }]) {
   const h = harness(settings);
   const review = await reviewSwap(h.client, h.quote);
   const result = await h.execute(h.quote, review, h.initial);
@@ -157,6 +195,16 @@ for (const settings of [{}, { context: reverse, allowance: 0n }]) {
     assert.equal(result.record.approvalHash, approvalHash);
   } else assert.equal(h.sent.length, 1);
 }
+
+const maxClient = harness({ nativeBalance: 100n * 10n ** 18n }).client;
+const max = await maxSwapAmount(maxClient, account, USDC);
+assert.equal(max, 99_925_600n);
+const maxInput = { ...context, amount: max, policy: enabledFee };
+const maxQuote = parseSwapQuote(quoteFixture(maxInput), maxInput, Date.now(), enabledFee);
+assert.equal(maxQuote.amount, max);
+assert.equal(maxQuote.integratorFee, max / 1000n);
+await reviewSwap(maxClient, maxQuote);
+assert.equal(await maxSwapAmount(maxClient, account, EURC), 100_000_000n);
 
 for (const options of [{ balance: 0n }, { nativeBalance: 0n }, { rpcChain: 1 }]) {
   const h = harness(options);
@@ -212,5 +260,21 @@ assert.equal((await first).status, 'confirmed');
 assert.equal(duplicate.sent.length, 1);
 const wrongData = recordFixture(context, '0x55');
 assert.equal((await verifySwapRecord(duplicate.client, wrongData)).status, 'pending');
+const { integrator, ...legacyRecord } = duplicate.ledger.get(account);
+let livePolicy = enabledFee;
+const rollback = harness({ policy: enabledFee, allowance: 0n, currentPolicy: () => livePolicy });
+const review = await reviewSwap(rollback.client, rollback.quote);
+await assert.rejects(rollback.execute(rollback.quote, review, rollback.initial, ({ stage }) => {
+  if (stage === 'approved') livePolicy = { ...swapFee, version: '2' };
+}), /fee policy changed/);
+assert.equal(rollback.sent.length, 1);
+assert.equal(rollback.ledger.get(account).state, 'done');
+const staleReview = harness({ policy: enabledFee, currentPolicy: () => livePolicy });
+await assert.rejects(staleReview.execute(staleReview.quote, await reviewSwap(staleReview.client, staleReview.quote), staleReview.initial), /fee policy changed/);
+assert.equal(staleReview.sent.length, 0);
+
+const legacyReceipt = { transactionHash: swapHash, status: 'success', logs: settlementFixture({ ...context, integrator: 'lifi-api' }) };
+assert.equal((await verifySwapRecord(duplicate.client, legacyRecord, legacyReceipt)).status, 'confirmed');
+assert.equal((await verifySwapRecord(duplicate.client, { ...legacyRecord, integrator }, legacyReceipt)).status, 'pending');
 
 console.log('Arc pair, quote race, route validation, fees, wallet changes, allowance, rejection, revert, recovery and exact settlement passed.');

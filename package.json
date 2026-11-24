@@ -16,7 +16,9 @@
     "test:siwe": "node scripts/wallet-api.test.mjs",
     "test:transaction-dialog": "node scripts/transaction-dialog.test.mjs",
     "test:swap": "node scripts/swap.test.mjs",
-    "test:any-token": "node scripts/any-token.test.mjs"
+    "test:any-token": "node scripts/any-token.test.mjs",
+    "verify:release": "node scripts/verify-release.mjs",
+    "test:fee-policy": "node scripts/fee-policy.test.mjs"
   },
   "dependencies": {
     "@wagmi/core": "3.6.9",

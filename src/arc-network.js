@@ -56,4 +56,10 @@ export function validatePaymentLinkNetwork(params, network) {
   }
 }
 
-export const arcNetwork = resolveArcNetwork(import.meta.env);
+export const arcNetwork = resolveArcNetwork(typeof import.meta.env === 'undefined' ? undefined : {
+  VITE_TERMUL_NETWORK: import.meta.env.VITE_TERMUL_NETWORK,
+  VITE_TERMUL_MAINNET_CONTRACT_ADDRESS: import.meta.env.VITE_TERMUL_MAINNET_CONTRACT_ADDRESS,
+  VITE_TERMUL_MAINNET_DEPLOYMENT_BLOCK: import.meta.env.VITE_TERMUL_MAINNET_DEPLOYMENT_BLOCK,
+  VITE_TERMUL_MAINNET_RUNTIME_HASH: import.meta.env.VITE_TERMUL_MAINNET_RUNTIME_HASH,
+  VITE_TERMUL_MAINNET_RPC_URL: import.meta.env.VITE_TERMUL_MAINNET_RPC_URL,
+});

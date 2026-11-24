@@ -45,7 +45,7 @@ Run the contract build locally so the browser fixture can compare the artifact w
 ```bash
 (cd contracts && forge build)
 VITE_TERMUL_WALLET_API_URL=https://fixture.supabase.co/functions/v1/termul-wallet-v1 \
-  npm run build -- --outDir /tmp/termul-wallet-browser-dist
+  npm run build -- --mode browser-fixture --outDir /tmp/termul-wallet-browser-dist
 TERMUL_PLAYWRIGHT=/absolute/path/to/playwright/index.mjs \
   TERMUL_FIXTURE_DIST=/tmp/termul-wallet-browser-dist \
   node scripts/wallet-browser.test.mjs

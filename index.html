@@ -89,7 +89,8 @@
  <dl class="swap-details">
   <dt>Minimum received</dt><dd data-review="minimum"></dd>
   <dt>Route</dt><dd data-review="route"></dd>
-  <dt>Provider fee</dt><dd data-review="provider-fee"></dd>
+  <dt>LI.FI fee</dt><dd data-review="provider-fee"></dd>
+  <dt data-review="termul-fee-label" hidden>Termul fee (0.1%)</dt><dd data-review="termul-fee" hidden></dd>
   <dt>Network fee limit</dt><dd data-review="gas"></dd>
   <dt>Recipient</dt><dd class="mono" data-review="account"></dd>
  </dl>
@@ -138,8 +139,8 @@
     <dt>Price impact</dt><dd data-swap="impact">—</dd>
     <dt>Route</dt><dd data-swap="route">—</dd>
     <dt>Est. network fee</dt><dd data-swap="network-fee">—</dd>
-    <dt>Provider fee (included)</dt><dd data-swap="provider-fee">—</dd>
-    <dt>Termul fee</dt><dd>0%</dd>
+    <dt>LI.FI fee (included)</dt><dd data-swap="provider-fee">—</dd>
+    <dt data-swap="termul-fee-label">Termul fee</dt><dd data-swap="termul-fee">0%</dd>
    </dl>
    <details class="fee-disclosure hidden" data-swap="fee-details"><summary>Exact network fee</summary><span class="mono" data-swap="network-fee-exact"></span></details>
    <p class="hint swap-fee-note">Network fees are paid in USDC. A token approval, if needed, has its own fee.</p>
@@ -162,6 +163,7 @@
     <span aria-hidden="true">→</span>
     <div><span>Receive</span><strong data-exchange-network="to"></strong></div>
    </div>
+   <p id="exchange-termul-fee" class="hint" hidden></p>
    <div id="exchange-widget"></div>
    <section id="exchange-recovery" class="panel exchange-recovery hidden" aria-label="Latest exchange">
     <h2>Latest exchange</h2>

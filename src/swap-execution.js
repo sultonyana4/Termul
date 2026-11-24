@@ -1,3 +1,5 @@
+import { assertCurrentFeePolicy, feePolicyChanged, sameFeePolicy } from './fee-policy.js';
+import { TERMUL_INTEGRATOR } from './swap-fee.js';
 import { decodeEventLog, encodeFunctionData, erc20Abi, keccak256, numberToHex, parseAbi, zeroAddress } from 'viem';
 import { arcNetwork } from './arc-network.js';
 import { assertWalletProvider, sameWallet } from './wallet-provider.js';
@@ -64,7 +66,7 @@ export async function reviewSwap(client, quote) {
   const gasBudget = priceLimit * (quote.gasLimit + (needsApproval ? APPROVAL_GAS_LIMIT : 0n));
   requireBalance(quote, balances, gasBudget);
   assertFreshQuote(quote);
-  return { needsApproval, gasBudget, gasPrice: priceLimit };
+  return { needsApproval, gasBudget, gasPrice: priceLimit, feePolicy: quote.feePolicy };
 }
 
 async function verifyRouteDeployment(client, data) {
@@ -85,6 +87,7 @@ function validateRecord(record, account) {
     || !Object.hasOwn(SWAP_TOKENS, record.to) || record.from === record.to
     || !['approval', 'swap'].includes(record.phase) || !isHash(record.dataHash) || !isHash(record.id)
     || (record.hash !== null && !isHash(record.hash)) || (record.approvalHash && !isHash(record.approvalHash))
+    || (record.integrator !== undefined && record.integrator !== TERMUL_INTEGRATOR)
     || !['pending', 'done'].includes(record.state) || unsigned(record.amount) <= 0n || unsigned(record.minimum) <= 0n) {
     throw new Error('The saved swap reference is invalid.');
   }
@@ -113,7 +116,7 @@ function verifiedTransfers(receipt, record) {
     if (equalAddress(log.address, SWAP_ROUTER)) {
       try {
         const { args } = decodeEventLog({ abi: completedAbi, data: log.data, topics: log.topics });
-        if (completion || args.transactionId.toLowerCase() !== record.id.toLowerCase() || args.integrator !== 'lifi-api'
+        if (completion || args.transactionId.toLowerCase() !== record.id.toLowerCase() || args.integrator !== (record.integrator ?? 'lifi-api')
           || !equalAddress(args.referrer, zeroAddress) || !equalAddress(args.receiver, record.account) || !equalAddress(args.fromAssetId, from.address)
           || !equalAddress(args.toAssetId, to.address) || args.fromAmount !== unsigned(record.amount)) return null;
         completion = args;
@@ -163,7 +166,7 @@ function sameSelection(wallet, selection, quote) {
   }
 }
 
-export function createSwapExecution({ client, wallet, ledger, deploymentCheck = verifyRouteDeployment }) {
+export function createSwapExecution({ client, wallet, ledger, deploymentCheck = verifyRouteDeployment, verifyPolicy = assertCurrentFeePolicy }) {
   let busy = false;
 
   return async function execute(quote, review, selection, onProgress = () => {}) {
@@ -173,6 +176,8 @@ export function createSwapExecution({ client, wallet, ledger, deploymentCheck = 
       sameSelection(wallet, selection, quote);
       if (ledger.get(quote.account)?.state === 'pending') throw new Error('Check the previous swap request before starting another.');
       assertFreshQuote(quote);
+      if (!sameFeePolicy(quote.feePolicy, review.feePolicy)) throw new Error(feePolicyChanged);
+      await verifyPolicy(quote.feePolicy);
       await requireMainnet(client);
       await deploymentCheck(client, quote.data);
       const provider = await wallet.getProvider(selection);
@@ -194,6 +199,7 @@ export function createSwapExecution({ client, wallet, ledger, deploymentCheck = 
         if (bufferedGas > limit || price > review.gasPrice) throw new Error('The network fee changed. Review a new quote.');
         requireBalance(quote, balances, bufferedGas * price + remainingGas * review.gasPrice);
         await assertWalletProvider(provider, quote.account);
+        await verifyPolicy(quote.feePolicy);
         sameSelection(wallet, selection, quote);
         assertFreshQuote(quote);
         const previous = ledger.get(quote.account);
@@ -201,7 +207,7 @@ export function createSwapExecution({ client, wallet, ledger, deploymentCheck = 
         const record = {
           account: quote.account, from: quote.from.symbol, to: quote.to.symbol, amount: quote.amount.toString(),
           minimum: quote.minimum.toString(), phase, approvalHash: approvalHash || null,
-          state: 'pending', hash: null, dataHash: keccak256(call.data), id: quote.id,
+          state: 'pending', hash: null, dataHash: keccak256(call.data), id: quote.id, integrator: quote.integrator,
         };
         ledger.put(record);
         onProgress({ stage: 'wallet', record });

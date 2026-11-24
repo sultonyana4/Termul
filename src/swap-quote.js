@@ -1,5 +1,11 @@
-import { decodeFunctionData, encodeFunctionData, formatUnits, getAddress, parseAbi, parseUnits, slice, zeroAddress } from 'viem';
+import { formatUnits, getAddress, parseAbi, parseUnits, slice, zeroAddress } from 'viem';
 import { arcNetwork } from './arc-network.js';
+import {
+  ARC_FEE_FORWARDER, TERMUL_INTEGRATOR, decodeExact, equalAddress, matchesFeeRate, noExtraDistributions,
+  readFeeSplit, swapFee, validateFeeForwarding,
+} from './swap-fee.js';
+
+export { ARC_FEE_FORWARDER as FEE_FORWARDER, FEE_ABI, equalAddress } from './swap-fee.js';
 
 export const SWAP_TOKENS = Object.freeze({
   USDC: Object.freeze({ symbol: 'USDC', address: '0x3600000000000000000000000000000000000000', decimals: 6 }),
@@ -7,23 +13,19 @@ export const SWAP_TOKENS = Object.freeze({
 });
 export const SWAP_ROUTER = '0xA4072583658Fae592A3506A42431cb6316a8d40b';
 export const SWAP_FACET = '0x0E60f12E2CE6b4EA51bde7A2aD61A22B12605c9C';
-export const FEE_FORWARDER = '0x906A51f3d8dF12B7030D5299D1098dd89fFe830b';
 export const FLY_ROUTER = '0x20F6ee51340aDEed01A59B0e65cB3703f3dc860c';
-const LIFI_FEE_WALLET = '0xc06ebbefd94032b85424d51906e2a335efae264b';
 export const QUOTE_TTL = 30_000;
 export const SLIPPAGE = 0.005;
 export const APPROVAL_GAS_LIMIT = 100_000n;
 export const MAX_SWAP_GAS_LIMIT = 3_000_000n;
 const MAX_UINT = (1n << 256n) - 1n;
 
-const step = '(address callTo, address approveTo, address sendingAssetId, address receivingAssetId, uint256 fromAmount, bytes callData, bool requiresDeposit)';
+export const SWAP_STEP = '(address callTo, address approveTo, address sendingAssetId, address receivingAssetId, uint256 fromAmount, bytes callData, bool requiresDeposit)';
 export const SWAP_ABI = parseAbi([
-  `function swapTokensSingleV3ERC20ToERC20(bytes32 id, string integrator, string referrer, address receiver, uint256 minAmount, ${step} swapData)`,
-  `function swapTokensMultipleV3ERC20ToERC20(bytes32 id, string integrator, string referrer, address receiver, uint256 minAmount, ${step}[] swapData)`,
+  `function swapTokensSingleV3ERC20ToERC20(bytes32 id, string integrator, string referrer, address receiver, uint256 minAmount, ${SWAP_STEP} swapData)`,
+  `function swapTokensMultipleV3ERC20ToERC20(bytes32 id, string integrator, string referrer, address receiver, uint256 minAmount, ${SWAP_STEP}[] swapData)`,
 ]);
-export const FEE_ABI = parseAbi(['function forwardERC20Fees(address token, (address recipient, uint256 amount)[] distributions)']);
 export const FLY_ABI = parseAbi(['function swapWithBackendSignature(bytes data)']);
-export const equalAddress = (a, b) => /^0x[0-9a-f]{40}$/i.test(a ?? '') && typeof b === 'string' && a.toLowerCase() === b.toLowerCase();
 export const isHash = value => typeof value === 'string' && /^0x[0-9a-f]{64}$/i.test(value);
 export const tokenAmount = (amount, token) => `${formatUnits(amount, token.decimals)} ${token.symbol}`;
 
@@ -53,21 +55,6 @@ function tokenMatches(value, token) {
   return value?.chainId === arcNetwork.id && value.decimals === token.decimals && equalAddress(value.address, token.address);
 }
 
-function decodeExact(abi, data) {
-  requireRoute(typeof data === 'string' && /^0x(?:[\da-f]{2}){4,12000}$/i.test(data));
-  const decoded = decodeFunctionData({ abi, data });
-  requireRoute(encodeFunctionData({ abi, ...decoded }).toLowerCase() === data.toLowerCase());
-  return decoded;
-}
-
-function validateFee(step, token, amount, feeAmount) {
-  requireRoute(step?.requiresDeposit && equalAddress(step.callTo, FEE_FORWARDER) && equalAddress(step.approveTo, FEE_FORWARDER)
-    && equalAddress(step.sendingAssetId, token.address) && equalAddress(step.receivingAssetId, token.address) && step.fromAmount === amount);
-  const { args: [asset, distributions] } = decodeExact(FEE_ABI, step.callData);
-  requireRoute(equalAddress(asset, token.address) && distributions.length === 1
-    && equalAddress(distributions[0].recipient, LIFI_FEE_WALLET) && distributions[0].amount === feeAmount);
-}
-
 function validateFly(step, from, to, amount, requiresDeposit) {
   requireRoute(step?.requiresDeposit === requiresDeposit && equalAddress(step.callTo, FLY_ROUTER) && equalAddress(step.approveTo, FLY_ROUTER)
     && equalAddress(step.sendingAssetId, from.address) && equalAddress(step.receivingAssetId, to.address) && step.fromAmount === amount);
@@ -80,10 +67,10 @@ function validateFly(step, from, to, amount, requiresDeposit) {
     && unsigned(slice(packed, 64, 96)) === amount);
 }
 
-export function parseSwapQuote(raw, { from, to, amount, account }, requestedAt) {
+export function parseSwapQuote(raw, { from, to, amount, account }, requestedAt, policy = swapFee) {
   const { action, estimate, transactionRequest: request } = raw;
   requireRoute(SWAP_TOKENS[from?.symbol] === from && SWAP_TOKENS[to?.symbol] === to && from !== to &&
-    raw.type === 'lifi' && raw.tool === 'fly' && raw.integrator === 'lifi-api' && raw.fee === 0
+    raw.type === 'lifi' && raw.tool === 'fly' && raw.integrator === TERMUL_INTEGRATOR && matchesFeeRate(raw.fee, policy) && noExtraDistributions(raw)
     && action?.fromChainId === arcNetwork.id && action.toChainId === arcNetwork.id && action.slippage === SLIPPAGE
     && tokenMatches(action.fromToken, from) && tokenMatches(action.toToken, to)
     && equalAddress(action.fromAddress, account) && equalAddress(action.toAddress, account)
@@ -97,26 +84,19 @@ export function parseSwapQuote(raw, { from, to, amount, account }, requestedAt) 
     && gasLimit > 0n && gasLimit <= MAX_SWAP_GAS_LIMIT);
 
   const fees = estimate.feeCosts ?? [];
-  requireRoute(Array.isArray(fees) && fees.length <= 1);
-  let providerFee = 0n;
-  if (fees.length) {
-    const fee = fees[0];
-    providerFee = unsigned(fee.amount);
-    requireRoute(fee.name === 'LIFI Fixed Fee' && fee.included === true && tokenMatches(fee.token, from)
-      && unsigned(fee.feeSplit?.integratorFee) === 0n && unsigned(fee.feeSplit?.lifiFee) === providerFee
-      && providerFee > 0n && providerFee <= amount / 100n);
-  }
+  requireRoute(Array.isArray(fees) && fees.length <= 1 && (!policy.bps || fees.length === 1));
+  const fee = fees.length ? readFeeSplit(fees[0], action.fromToken, amount, policy) : null;
 
   const { functionName, args: [id, integrator, referrer, receiver, min, data] } = decodeExact(SWAP_ABI, request.data);
   requireRoute(isHash(id) && id.toLowerCase() === raw.transactionId?.toLowerCase()
-    && integrator === 'lifi-api' && equalAddress(referrer, zeroAddress) && equalAddress(receiver, account) && min === minimum);
-  if (!providerFee) {
+    && integrator === TERMUL_INTEGRATOR && equalAddress(referrer, zeroAddress) && equalAddress(receiver, account) && min === minimum);
+  if (!fee) {
     requireRoute(functionName === 'swapTokensSingleV3ERC20ToERC20');
     validateFly(data, from, to, amount, true);
   } else {
     requireRoute(functionName === 'swapTokensMultipleV3ERC20ToERC20' && data.length === 2);
-    validateFee(data[0], from, amount, providerFee);
-    validateFly(data[1], from, to, amount - providerFee, false);
+    validateFeeForwarding(data[0], ARC_FEE_FORWARDER, from.address, amount, fee);
+    validateFly(data[1], from, to, amount - fee.total, false);
   }
 
   const gasCosts = estimate.gasCosts ?? [];
@@ -128,20 +108,21 @@ export function parseSwapQuote(raw, { from, to, amount, account }, requestedAt) 
   const impact = estimate.priceImpact;
   const priceImpact = ['string', 'number'].includes(typeof impact) && /^-?\d{1,4}(?:\.\d{1,8})?$/.test(String(impact)) ? String(impact) : null;
   return Object.freeze({
-    account: getAddress(account), from, to, amount, received, minimum, providerFee, id,
+    account: getAddress(account), from, to, amount, received, minimum, feePolicy: policy, providerFee: fee?.providerFee ?? 0n, integratorFee: fee?.integratorFee ?? 0n, integrator, id,
     networkFee: gasCosts.length ? networkFee : null, priceImpact,
     route: 'LI.FI · Fly', gasLimit, expiresAt: requestedAt + QUOTE_TTL, data: request.data,
   });
 }
 
 const previewAddress = '0x000000000000000000000000000000000000dEaD';
-export async function fetchSwapQuote(input, signal, fetcher = fetch, now = Date.now) {
+export async function fetchSwapQuote(input, signal, fetcher = fetch, now = Date.now, policy = swapFee) {
+  if (policy.bps && !policy.recipient) throw new Error('Configure the public Termul fee recipient before requesting a quote.');
   const requestedAt = now();
   const params = new URLSearchParams({
     fromChain: String(arcNetwork.id), toChain: String(arcNetwork.id),
     fromToken: input.from.address, toToken: input.to.address, fromAmount: input.amount.toString(),
     fromAddress: input.account || previewAddress, toAddress: input.account || previewAddress,
-    slippage: String(SLIPPAGE), fee: '0', allowExchanges: 'fly',
+    slippage: String(SLIPPAGE), integrator: TERMUL_INTEGRATOR, fee: String(policy.rate), allowExchanges: 'fly',
   });
   const result = await fetcher('https://li.quest/v1/quote?' + params, {
     signal: AbortSignal.any([signal, AbortSignal.timeout(10_000)]), cache: 'no-store', redirect: 'error',
@@ -152,7 +133,7 @@ export async function fetchSwapQuote(input, signal, fetcher = fetch, now = Date.
   }
   let quote;
   try {
-    quote = parseSwapQuote(await result.json(), { ...input, account: params.get('fromAddress') }, requestedAt);
+    quote = parseSwapQuote(await result.json(), { ...input, account: params.get('fromAddress') }, requestedAt, policy);
   } catch {
     throw new Error('LI.FI returned a route this app does not support. Try another amount.');
   }

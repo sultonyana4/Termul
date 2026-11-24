@@ -1,3 +1,5 @@
+import { feePolicyChanged, loadFeePolicy, sameFeePolicy } from './fee-policy.js';
+import { TERMUL_FEE_LABEL } from './swap-fee.js';
 import { createElement as h, useEffect } from 'react';
 import { createRoot } from 'react-dom/client';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
@@ -90,6 +92,8 @@ export async function mountAnyToken({ root, active, status }) {
   let shown = false;
 
   const setStatus = message => { status.textContent = message; };
+  const feeDisclosure = $('#exchange-termul-fee');
+  let activePolicy;
   function showNetwork(field, chainId) {
     const label = networkLabels[field];
     const network = networks.get(chainId);
@@ -195,7 +199,7 @@ export async function mountAnyToken({ root, active, status }) {
     }
   }
 
-  const send = createExchangeSender({ wallet, chainClient, ledger, active, update });
+  const send = createExchangeSender({ wallet, chainClient, ledger, active, update, verifyPolicy: checkPolicy });
 
   async function guardedClient() {
     const selection = wallet.getSelection();
@@ -251,48 +255,73 @@ export async function mountAnyToken({ root, active, status }) {
     }),
   })];
 
-  const listeners = [
+  const listeners = policy => [
     [WidgetEvent.FormFieldChanged, ({ fieldName, newValue }) => {
       if (Object.hasOwn(networkLabels, fieldName)) showNetwork(fieldName, newValue);
     }],
     [WidgetEvent.RouteExecutionStarted, route => {
+      if (policy !== activePolicy) return;
       plan = null;
       prepared = null;
       preparing = null;
       if (!active()) return;
       try {
-        plan = reviewExchangeRoute(route, wallet.getSelection(), networks);
-        setStatus('Route reviewed. Follow the next step in the exchange.');
+        plan = reviewExchangeRoute(route, wallet.getSelection(), networks, Date.now(), policy);
+        setStatus(plan.fee
+          ? `${TERMUL_FEE_LABEL} · ${amountText(plan.fee.integratorFee, plan.fromToken)} included. LI.FI fee · ${amountText(plan.fee.providerFee, plan.fromToken)} included.`
+          : 'Route reviewed. Follow the next step in the exchange.');
       } catch (error) { setStatus(error.message); }
     }],
     [WidgetEvent.RouteExecutionUpdated, ({ route, action }) => {
-      if (!active() || !plan || route.id !== plan.routeId || action.status !== 'ACTION_REQUIRED'
+      if (policy !== activePolicy || !active() || !plan || route.id !== plan.routeId || action.status !== 'ACTION_REQUIRED'
         || !['CROSS_CHAIN', 'SWAP'].includes(action.type)) return;
-      try { prepared = preparedExchangeStep(plan, route, wallet.getSelection(), networks); }
+      try { prepared = preparedExchangeStep(plan, route, wallet.getSelection(), networks, policy); }
       catch (error) { prepared = null; setStatus(error.message); }
     }],
     [WidgetEvent.RouteExecutionCompleted, () => { if (active()) void refresh(); }],
     [WidgetEvent.RouteExecutionFailed, () => { if (active()) void refresh(); }],
   ];
 
-  const config = exchangeWidgetConfig(networks, providers, () => wallet.connect(), async request => {
-    if (!active() || !plan || !matches(plan.account, wallet.getSelection()?.address)) {
-      throw new Error('The route or selected wallet changed. Review it again.');
+  const widgetRoot = createRoot(root);
+  function applyPolicy(policy) {
+    if (sameFeePolicy(policy, activePolicy)) return false;
+    activePolicy = policy;
+    plan = prepared = preparing = null;
+    feeDisclosure.hidden = !policy.bps;
+    feeDisclosure.textContent = policy.bps
+      ? `${TERMUL_FEE_LABEL} is included in the quote. Network and other provider fees are shown separately.` : '';
+    const config = exchangeWidgetConfig(networks, providers, () => wallet.connect(), async request => {
+      const reviewed = plan;
+      if (policy !== activePolicy || !active() || !reviewed || !matches(reviewed.account, wallet.getSelection()?.address)) {
+        throw new Error('The route or selected wallet changed. Review it again.');
+      }
+      if (request.requestType !== 'approve' && request.requestType !== 'transaction') throw new Error('Unsupported exchange request.');
+      await checkPolicy(reviewed.feePolicy);
+      if (reviewed !== plan) throw new Error('The route changed. Review a fresh quote.');
+      // Require both this hook and the next ACTION_REQUIRED event.
+      if (request.requestType === 'transaction') prepared = null;
+      preparing = request;
+      return request;
+    }, policy);
+    const query = new QueryClient({ defaultOptions: { queries: { retry: 1 } } });
+    showNetwork('fromChain', config.fromChain);
+    showNetwork('toChain', config.toChain);
+    networkSummary.hidden = false;
+    widgetRoot.render(h(QueryClientProvider, { key: policy.version + ':' + policy.bps, client: query },
+      h(WagmiProvider, { config: walletConfig, reconnectOnMount: false },
+        h(LiFiWidget, { integrator: config.integrator, config }), h(Events, { listeners: listeners(policy) }))));
+    return true;
+  }
+
+  async function checkPolicy(expected) {
+    const current = await loadFeePolicy();
+    if (!sameFeePolicy(expected, activePolicy)) throw new Error(feePolicyChanged);
+    if (!sameFeePolicy(expected, current)) {
+      applyPolicy(current);
+      setStatus(feePolicyChanged);
+      throw new Error(feePolicyChanged);
     }
-    if (request.requestType !== 'approve' && request.requestType !== 'transaction') throw new Error('Unsupported exchange request.');
-    // The SDK next emits ACTION_REQUIRED with the updated route. Require both
-    // that event and this hook to agree before sending the swap transaction.
-    if (request.requestType === 'transaction') prepared = null;
-    preparing = request;
-    return request;
-  });
-  const query = new QueryClient({ defaultOptions: { queries: { retry: 1 } } });
-  showNetwork('fromChain', config.fromChain);
-  showNetwork('toChain', config.toChain);
-  networkSummary.hidden = false;
-  createRoot(root).render(h(QueryClientProvider, { client: query },
-    h(WagmiProvider, { config: walletConfig, reconnectOnMount: false },
-      h(LiFiWidget, { integrator: config.integrator, config }), h(Events, { listeners }))));
+  }
 
   function walletChanged() {
     const selection = wallet.getSelection();
@@ -316,6 +345,9 @@ export async function mountAnyToken({ root, active, status }) {
     if (!open) return;
     polls = 0;
     walletChanged();
+    void loadFeePolicy().then(policy => {
+      if (shown && applyPolicy(policy)) setStatus('');
+    }).catch(error => { if (shown) setStatus(error.message); });
     pollTimer = setInterval(refresh, 15_000);
   }
   setStatus('');

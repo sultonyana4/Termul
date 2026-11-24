@@ -4,14 +4,22 @@ import { extname, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { encodeAbiParameters, encodeEventTopics, encodeFunctionData, encodeFunctionResult, erc20Abi, keccak256, numberToHex, parseAbi } from 'viem';
 import { createSiweMessage, parseSiweMessage } from 'viem/siwe';
+import { FEE_POLICY_CHECK, FEE_POLICY_FILE, parseFeePolicy, TERMUL_FEE_RECIPIENT } from '../src/fee-policy.js';
+import { serializeFeePolicy } from '../src/fee-policy.js';
+import { feePolicyChallenge } from '../src/fee-policy-server.js';
 import { arcNetwork } from '../src/arc-network.js';
 import { exchangeChain } from '../src/any-token-networks.js';
 import { SWAP_ROUTER, SWAP_TOKENS } from '../src/swap-quote.js';
 import { quoteFixture, quotedInput, recordFixture, settlementFixture, swapHash } from './swap-fixtures.mjs';
 
-const { TERMUL_PLAYWRIGHT, TERMUL_CHROMIUM, TERMUL_FIXTURE_DIST } = process.env;
+const { TERMUL_PLAYWRIGHT, TERMUL_CHROMIUM, TERMUL_FIXTURE_DIST, TERMUL_FIXTURE_FEE_ENABLED } = process.env;
 assert.ok(TERMUL_PLAYWRIGHT && TERMUL_FIXTURE_DIST, 'Set TERMUL_PLAYWRIGHT to the installed Playwright entry and TERMUL_FIXTURE_DIST to the browser fixture build.');
 const { chromium } = await import(pathToFileURL(resolve(TERMUL_PLAYWRIGHT)));
+let currentPolicy = parseFeePolicy(JSON.parse(await readFile(resolve(TERMUL_FIXTURE_DIST, FEE_POLICY_FILE), 'utf8')));
+assert.equal(currentPolicy.bps, TERMUL_FIXTURE_FEE_ENABLED === '1' ? 10 : 0);
+let challengeFault;
+let lastChallenge;
+const policy = currentPolicy.bps ? currentPolicy : undefined;
 const origin = arcNetwork.origin;
 const api = 'https://fixture.supabase.co/functions/v1/termul-wallet-v1';
 const contract = arcNetwork.contractAddress;
@@ -49,7 +57,7 @@ const payment = {
 const actions = [];
 const widths = [320, 375, 400, 768, 1024, 1440];
 let nativeBalance = 5n * 10n ** 18n;
-const swapContext = { from: SWAP_TOKENS.USDC, to: SWAP_TOKENS.EURC, amount: quotedInput, account: merchant };
+const swapContext = { from: SWAP_TOKENS.USDC, to: SWAP_TOKENS.EURC, amount: quotedInput, account: merchant, policy };
 const swapQuote = quoteFixture(swapContext);
 const swapInput = swapQuote.transactionRequest.data;
 const swapLog = settlementFixture(swapContext).map((log, index) => ({ ...log,
@@ -96,6 +104,22 @@ try {
     const cors = { 'access-control-allow-origin': origin, 'access-control-allow-headers': 'content-type, authorization',
       'access-control-allow-methods': 'POST, OPTIONS' };
     const reply = json => route.fulfill({ json, headers: cors });
+    if (url.origin === origin && url.pathname === '/' + FEE_POLICY_FILE) {
+      assert.ok(url.searchParams.get('check'));
+      return route.fulfill({ headers: { 'cache-control': 'no-store', 'content-type': 'application/json' },
+        json: serializeFeePolicy(currentPolicy) });
+    }
+    if (url.origin === origin && url.pathname === FEE_POLICY_CHECK) {
+      const response = feePolicyChallenge(new Request(url.href), currentPolicy.version === '0' ? {} : {
+        bps: String(currentPolicy.bps), version: currentPolicy.version, environment: 'production',
+      });
+      const headers = Object.fromEntries(response.headers);
+      if (challengeFault === 'unavailable') return route.fulfill({ status: 503, headers });
+      if (challengeFault === 'replay') return route.fulfill({ status: 200, headers, body: lastChallenge });
+      const body = await response.text();
+      if (response.ok) lastChallenge = body;
+      return route.fulfill({ status: response.status, headers, body });
+    }
     if (url.origin === 'https://li.quest' && url.pathname === '/v1/chains') return reply({ chains: fixtureChains });
     if (url.origin === 'https://li.quest' && url.pathname === '/v1/tokens') return reply({ tokens: { 5042: [fromCoin, arcEURC], 8453: [toCoin] } });
     if (url.origin === 'https://li.quest' && url.pathname === '/v1/token') return reply(
@@ -128,11 +152,11 @@ try {
     if (url.origin === 'https://li.quest' && url.pathname === '/v1/quote' && request.method() === 'GET') {
       assert.equal(url.searchParams.get('fromChain'), '5042');
       assert.equal(url.searchParams.get('toChain'), '5042');
-      assert.equal(url.searchParams.get('fee'), '0');
-      assert.equal(url.searchParams.get('integrator'), null);
+      assert.equal(url.searchParams.get('fee'), String(currentPolicy.rate));
+      assert.equal(url.searchParams.get('integrator'), 'termul');
       const from = Object.values(SWAP_TOKENS).find(token => token.address === url.searchParams.get('fromToken'));
       const to = Object.values(SWAP_TOKENS).find(token => token.address === url.searchParams.get('toToken'));
-      return reply(quoteFixture({ from, to, amount: BigInt(url.searchParams.get('fromAmount')), account: url.searchParams.get('fromAddress') }));
+      return reply(quoteFixture({ from, to, amount: BigInt(url.searchParams.get('fromAmount')), account: url.searchParams.get('fromAddress'), policy: currentPolicy }));
     }
     if (request.method() === 'OPTIONS' && (url.href === api || url.origin === arcNetwork.rpcUrl)) {
       return route.fulfill({ status: 204, headers: cors });
@@ -200,6 +224,7 @@ try {
       if (body.action === 'get_payment_attempt') return reply({ attempt: null });
       if (body.action === 'logout') return reply({ ok: true });
     }
+    if (policy && url.href === 'https://registry.npmjs.org/@lifi/widget/latest') return reply({ version: '4.11.0' });
     if (url.origin === 'https://fonts.googleapis.com') return route.fulfill({ body: '', contentType: 'text/css' });
     if (url.href === 'https://lifinance.github.io/types/src/assets/icons/chains/ethereum.svg') {
       return route.fulfill({ body: await readFile(resolve(TERMUL_FIXTURE_DIST, 'brand/usdc.svg')), contentType: 'image/svg+xml' });
@@ -303,6 +328,7 @@ try {
   await page.locator('.side-nav [data-nav="swap"]').click();
   await page.getByRole('tab', { name: 'Any Token' }).click();
   await page.locator('#exchange-widget input').first().waitFor();
+  assert.equal(await page.locator('#exchange-termul-fee').isVisible(), Boolean(policy));
   const networkSummary = page.getByRole('group', { name: 'Selected networks' });
   const sourceNetwork = networkSummary.locator('[data-exchange-network="from"]');
   const destinationNetwork = networkSummary.locator('[data-exchange-network="to"]');
@@ -441,6 +467,8 @@ try {
   await page.locator('#swap-input').fill('1');
   await page.getByText('LI.FI · Fly', { exact: true }).waitFor();
   assert.equal(await page.locator('[data-swap="provider-fee"]').textContent(), '0.0025 USDC');
+  assert.equal(await page.locator('[data-swap="termul-fee"]').textContent(), policy ? '0.001 USDC (included)' : '0%');
+  assert.equal(await page.locator('[data-swap="termul-fee-label"]').textContent(), policy ? 'Termul fee (0.1%)' : 'Termul fee');
   assert.equal(await page.locator('[data-swap="impact"]').textContent(), '0.12%');
   await page.getByRole('button', { name: 'Switch swap direction' }).click();
   await page.getByText('0.0025 EURC', { exact: true }).waitFor();
@@ -470,6 +498,9 @@ try {
     const swapReview = page.getByRole('dialog', { name: 'Review swap' });
     await swapReview.waitFor();
     assert.equal(await swapReview.locator('[data-review="send"]').textContent(), '5 EURC');
+    const reviewFee = swapReview.locator('[data-review="termul-fee"]');
+    assert.equal(await reviewFee.isVisible(), Boolean(policy));
+    if (policy) assert.equal(await reviewFee.textContent(), '0.005 EURC (included)');
     assert.equal(await swapReview.locator('[data-review="account"]').textContent(), merchant);
     assert.equal(await fits(swapReview), true);
     assert.equal(await fits(swapReview.getByRole('button', { name: 'Cancel' })), true);
@@ -508,6 +539,7 @@ try {
   await exchangeTab.click();
   assert.equal(await page.getByText(/Codex is unavailable/i).count(), 0);
   await page.locator('#exchange-widget input').first().waitFor();
+  assert.equal(await page.locator('#exchange-termul-fee').isVisible(), Boolean(policy));
   for (const width of widths) {
     await page.setViewportSize({ width, height: 650 });
     assert.equal(await fits(networkSummary), true);
@@ -541,6 +573,34 @@ try {
   await page.getByRole('button', { name: 'View receipt' }).click();
   await bridge.waitFor();
   await bridge.getByRole('button', { name: 'Done' }).click();
+  if (policy) {
+    await page.getByRole('tab', { name: 'USDC & EURC' }).click();
+    if (await page.evaluate(() => window.termulWallet.getSelection().chainId) !== 5042) {
+      await page.getByRole('button', { name: 'Switch to Arc Mainnet', exact: true }).click();
+      await page.waitForFunction(() => window.termulWallet.getSelection().chainId === 5042);
+    }
+    const transactionDialog = page.locator('#transaction-dialog');
+    for (const fault of ['replay', 'unavailable', 'rollback']) {
+      await page.locator('#swap-input').fill('');
+      await page.locator('#swap-input').fill('1');
+      await page.locator('[data-swap="termul-fee"]').filter({ hasText: '0.001 USDC (included)' }).waitFor();
+      await page.getByRole('button', { name: 'Review swap', exact: true }).click();
+      await page.getByRole('dialog', { name: 'Review swap' }).waitFor();
+      if (fault === 'rollback') currentPolicy = parseFeePolicy({ version: '2', bps: 0, recipient: TERMUL_FEE_RECIPIENT });
+      else challengeFault = fault;
+      await page.locator('#swap-confirm').click();
+      await transactionDialog.getByText(fault === 'rollback'
+        ? 'Termul’s fee policy changed. Review a fresh quote before signing.'
+        : 'Could not verify the Termul fee policy. Try again before starting a swap.', { exact: true }).waitFor();
+      challengeFault = undefined;
+      await transactionDialog.getByRole('button', { name: 'Close' }).click();
+    }
+    await page.waitForFunction(() => document.querySelector('[data-swap="termul-fee"]').textContent === '0%');
+    await exchangeTab.click();
+    await page.locator('#exchange-widget input').first().waitFor();
+    await page.locator('#exchange-termul-fee').waitFor({ state: 'hidden' });
+    assert.equal(await page.getByRole('button', { name: 'View receipt' }).isVisible(), true);
+  }
   assert.equal(await page.evaluate(() => window.fixtureUnexpectedWalletMethod), undefined);
   assert.deepEqual(unexpectedRequests, []);
   assert.deepEqual(browserErrors, []);

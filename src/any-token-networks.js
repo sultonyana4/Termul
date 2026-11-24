@@ -2,6 +2,7 @@ import {
   arbitrum, avalanche, base, codex, ink, linea, mainnet, monad, morph, optimism, plumeMainnet, polygon, sei, sonic, unichain, worldchain, xdc,
 } from 'viem/chains';
 import { arcChain } from './arc-network.js';
+import { TERMUL_INTEGRATOR, swapFee } from './swap-fee.js';
 
 export const exchangeChains = Object.freeze([
   arcChain, mainnet, base, arbitrum, optimism, polygon, avalanche, linea, unichain,
@@ -46,11 +47,11 @@ export function transactionLink(chainId, hash) {
 
 export const scanLink = hash => hashPattern.test(hash ?? '') ? 'https://scan.li.fi/tx/' + hash : null;
 
-export function exchangeWidgetConfig(networks, providers, connect, onPrepared) {
+export function exchangeWidgetConfig(networks, providers, connect, onPrepared, policy = swapFee) {
   const ids = [...networks.keys()];
   const defaultChain = networks.has(arcChain.id) ? arcChain.id : ids[0];
   return {
-    integrator: 'termul',
+    integrator: TERMUL_INTEGRATOR,
     appearance: 'dark',
     variant: 'compact',
     fromChain: defaultChain,
@@ -59,10 +60,14 @@ export function exchangeWidgetConfig(networks, providers, connect, onPrepared) {
     hiddenUI: { appearance: true, language: true, walletMenu: true, toAddress: true, history: true },
     defaultUI: { layout: 'cards', transactionDetailsExpanded: false },
     useGaslessRoutes: false,
-    feeConfig: { name: 'Termul', fee: 0, showFeePercentage: true },
+    feeConfig: {
+      name: policy.bps ? 'LI.FI and Termul fees (included)' : 'Termul',
+      fee: policy.rate,
+      showFeePercentage: !policy.bps,
+    },
     walletConfig: { onConnect: connect },
     providers,
-    storageScopeKey: 'termul-exchange',
+    storageScopeKey: 'termul-exchange-' + policy.version + '-' + policy.bps,
     sdkConfig: {
       apiUrl: lifiOrigin + '/v1',
       rpcUrls: Object.fromEntries([...networks].map(([id, { chain }]) => [id, chain.rpcUrls.default.http])),

@@ -1,28 +1,40 @@
+import { assertCurrentFeePolicy, sameFeePolicy } from './fee-policy.js';
 import { decodeEventLog, decodeFunctionData, encodeFunctionData, erc20Abi, keccak256, zeroAddress } from 'viem';
 import { addressPattern, exchangeChain, hashPattern, lifiOrigin, matches } from './any-token-networks.js';
+import { reviewExchangeFee, validateExchangeFeeTransaction, verifyFeeRouteDeployment } from './any-token-fees.js';
+import { feeUnits, requireFee, swapFee } from './swap-fee.js';
+import { verifyPolymerSettlement } from './polymer-settlement.js';
 import { assertProviderChain, sameWallet } from './wallet-provider.js';
 
 const tokenAmount = amount => typeof amount === 'string' && /^\d{1,78}$/.test(amount) ? BigInt(amount) : 0n;
 const quantity = value => typeof value === 'bigint' ? value : typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
   ? BigInt(value) : typeof value === 'string' && /^(?:0x[0-9a-f]{1,64}|\d{1,78})$/i.test(value) ? BigInt(value) : null;
 
-export function preparedExchangeStep(plan, route, selection, networks) {
-  const current = reviewExchangeRoute(route, selection, networks);
-  if (plan.routeId !== current.routeId || plan.stepId !== current.stepId
+export function preparedExchangeStep(plan, route, selection, networks, policy = swapFee) {
+  const current = reviewExchangeRoute(route, selection, networks, Date.now(), policy);
+  if (!sameFeePolicy(plan.feePolicy, current.feePolicy) || plan.routeId !== current.routeId || plan.stepId !== current.stepId
     || plan.fromChain !== current.fromChain || plan.toChain !== current.toChain
     || !matches(plan.fromToken.address, current.fromToken.address) || !matches(plan.toToken.address, current.toToken.address)
     || plan.fromToken.decimals !== current.fromToken.decimals || plan.toToken.decimals !== current.toToken.decimals
-    || plan.tool !== current.tool
+    || plan.tool !== current.tool || plan.fee?.total !== current.fee?.total
+    || plan.fee?.integratorFee !== current.fee?.integratorFee || plan.fee?.polymerFee !== current.fee?.polymerFee
     || plan.amount !== current.amount || tokenAmount(current.minimum) < tokenAmount(plan.minimum)
     || tokenAmount(current.maximumValue) > tokenAmount(plan.maximumValue)) {
     throw new Error('LI.FI changed this route. Review a fresh quote before signing.');
   }
-  return route.steps[0].transactionRequest;
+  const request = route.steps[0].transactionRequest;
+  if (current.fee) {
+    const validated = validateExchangeRequest(current, request, {
+      ...request, from: request?.from ?? current.account,
+    }, selection);
+    if (validated.kind !== 'source') throw new Error('Unsupported exchange transaction.');
+  }
+  return request;
 }
 const hexData = /^0x(?:[0-9a-f]{2}){4,24000}$/i;
 const routeMaxAge = 120_000;
 
-export function reviewExchangeRoute(route, selection, networks, now = Date.now()) {
+export function reviewExchangeRoute(route, selection, networks, now = Date.now(), policy = swapFee) {
   const step = Array.isArray(route?.steps) && route.steps.length === 1 ? route.steps[0] : null;
   const action = step?.action;
   const from = networks.get(action?.fromChainId);
@@ -38,9 +50,16 @@ export function reviewExchangeRoute(route, selection, networks, now = Date.now()
     || !tokenAmount(action.fromAmount) || !tokenAmount(step.estimate?.toAmountMin)
     || (step.estimate.approvalAddress && !matches(step.estimate.approvalAddress, from.router))
     || (step.includedSteps ?? []).some(part => !['swap', 'cross', 'protocol'].includes(part.type)
-      || !networks.has(part.action?.fromChainId) || !networks.has(part.action?.toChainId))
-    || (step.estimate.feeCosts ?? []).some(fee => tokenAmount(fee.feeSplit?.integratorFee) > 0n)
-    || (step.fee != null && Number(step.fee) !== 0)) throw new Error('Review a supported LI.FI route with this wallet as sender and recipient.');
+      || !networks.has(part.action?.fromChainId) || !networks.has(part.action?.toChainId))) throw new Error('Review a supported LI.FI route with this wallet as sender and recipient.');
+  const fee = reviewExchangeFee(step, from.router, policy);
+  if (fee) {
+    const sameToken = (display, execution) => validToken(display, execution.chainId)
+      && matches(display.address, execution.address) && display.decimals === execution.decimals;
+    requireFee(route.fromChainId === action.fromChainId && route.toChainId === action.toChainId
+      && sameToken(route.fromToken, action.fromToken) && sameToken(route.toToken, action.toToken)
+      && feeUnits(route.fromAmount) === feeUnits(action.fromAmount)
+      && feeUnits(route.toAmountMin) > 0n && feeUnits(route.toAmountMin) <= feeUnits(step.estimate.toAmountMin));
+  }
   const token = value => {
     const symbol = typeof value.symbol === 'string' && /^[\w.\- ]{1,20}$/.test(value.symbol) ? value.symbol : 'token';
     return { address: value.address, decimals: value.decimals, symbol };
@@ -50,7 +69,7 @@ export function reviewExchangeRoute(route, selection, networks, now = Date.now()
     fee.included === false && fee.token?.chainId === from.chain.id && matches(fee.token.address, zeroAddress)
       ? sum + tokenAmount(fee.amount) : sum, 0n);
   return {
-    routeId: route.id, stepId: step.id, account, connectorId: selection.connectorId, router: from.router,
+    routeId: route.id, stepId: step.id, fee, feePolicy: policy, account, connectorId: selection.connectorId, router: from.router,
     fromChain: from.chain.id, toChain: to.chain.id, fromToken: token(action.fromToken), toToken: token(action.toToken),
     amount: action.fromAmount, minimum: step.estimate.toAmountMin, maximumValue: String(nativeAmount + nativeFees),
     tool: typeof step.tool === 'string' && /^[\w.-]{1,48}$/.test(step.tool) ? step.tool : 'LI.FI',
@@ -83,7 +102,8 @@ export function validateExchangeRequest(plan, prepared, tx, selection, now = Dat
     || (matches(plan.fromToken.address, zeroAddress) && value < tokenAmount(plan.amount))) {
     throw new Error('LI.FI has not supplied a matching prepared transaction for this route. Refresh the quote.');
   }
-  return { kind: 'source', reset: false, value };
+  const feeCheck = plan.fee ? validateExchangeFeeTransaction(plan, tx.data, value) : null;
+  return { kind: 'source', reset: false, value, ...feeCheck };
 }
 
 const recordKey = account => 'termul.any-token.v1:' + account.toLowerCase();
@@ -93,7 +113,11 @@ export function exchangeLedger(storage) {
       const raw = storage.getItem(recordKey(account));
       if (!raw) return null;
       const r = JSON.parse(raw);
-      if (!matches(r.account, account) || !exchangeChain(r.fromChain) || !exchangeChain(r.toChain)
+      const burn = feeUnits(r.polymerBurnAmount);
+      const minimum = feeUnits(r.minimum);
+      if ((r.polymerBurnAmount !== undefined && (r.kind !== 'source' || r.tool !== 'polymerStandard'
+        || !(burn > 0n) || !(minimum > 0n) || burn >= feeUnits(r.amount) || burn < minimum))
+        || !matches(r.account, account) || !exchangeChain(r.fromChain) || !exchangeChain(r.toChain)
         || !addressPattern.test(r.router ?? '') || !addressPattern.test(r.target ?? '') || !hashPattern.test(r.dataHash ?? '')
         || !addressPattern.test(r.fromToken?.address ?? '') || !addressPattern.test(r.toToken?.address ?? '')
         || !['approval', 'source'].includes(r.kind) || (r.hash != null && !hashPattern.test(r.hash))) {
@@ -156,7 +180,9 @@ export async function reconcileExchange(record, chainClient, fetcher = fetch) {
     const data = await response.json();
     const { sending, receiving } = data;
     if (!matches(sending?.txHash, record.hash) || sending?.chainId !== record.fromChain) return { stage: 'source-confirmed' };
-    if (data.substatus === 'REFUNDED') return { stage: 'refunded' };
+    const polymerBurn = feeUnits(record.polymerBurnAmount);
+    const requiresPolymerProof = record.tool === 'polymerStandard' && polymerBurn > 0n;
+    if (data.substatus === 'REFUNDED') return { stage: requiresPolymerProof ? 'processing' : 'refunded' };
     if (data.status === 'FAILED') return { stage: 'failed' };
     if (data.substatus === 'PARTIAL') return { stage: 'partial' };
     if (data.status !== 'DONE' || data.substatus !== 'COMPLETED'
@@ -168,12 +194,13 @@ export async function reconcileExchange(record, chainClient, fetcher = fetch) {
       || !tokenAmount(receiving.amount) || tokenAmount(receiving.amount) < tokenAmount(record.minimum)) return { stage: 'processing' };
     const destination = chainClient(record.toChain);
     const sameReceipt = record.toChain === record.fromChain && matches(receiving.txHash, record.hash);
+    if (record.refundsNativeInput && !sameReceipt) return { stage: 'processing' };
     const [id, receipt] = sameReceipt ? [record.fromChain, source] : await Promise.all([
       destination.getChainId(), destination.getTransactionReceipt({ hash: receiving.txHash }),
     ]);
     if (id !== record.toChain || receipt.status !== 'success' || !matches(receipt.transactionHash, receiving.txHash)) return { stage: 'processing' };
     if (!matches(record.fromToken.address, zeroAddress) &&
-      walletTokenIncome(source, record.fromToken.address, record.account) !== -tokenAmount(sending.amount)) {
+      walletTokenIncome(source, record.fromToken.address, record.account) !== -tokenAmount(requiresPolymerProof ? record.amount : sending.amount)) {
       return { stage: 'processing' };
     }
     if (matches(record.fromToken.address, zeroAddress) && tokenAmount(sending.amount) > quantity(record.value)) {
@@ -181,13 +208,17 @@ export async function reconcileExchange(record, chainClient, fetcher = fetch) {
     }
     if (!matches(record.toToken.address, zeroAddress)
       && walletTokenIncome(receipt, record.toToken.address, record.account) !== tokenAmount(receiving.amount)) return { stage: 'processing' };
-    return { stage: 'completed', received: receiving.amount, sent: sending.amount, destinationHash: receiving.txHash };
+    if (requiresPolymerProof && (tokenAmount(receiving.amount) !== polymerBurn
+      || !await verifyPolymerSettlement(record, source, receipt, fetcher))) return { stage: 'processing' };
+    return { stage: 'completed', received: receiving.amount, sent: requiresPolymerProof ? record.amount : sending.amount, destinationHash: receiving.txHash };
   } catch {
     return { stage: 'source-confirmed' };
   }
 }
 
-export function createExchangeSender({ wallet, chainClient, ledger, active, update = () => {} }) {
+export function createExchangeSender({
+  wallet, chainClient, ledger, active, update = () => {}, verifyFeeDeployment = verifyFeeRouteDeployment, verifyPolicy = assertCurrentFeePolicy,
+}) {
   let busy = false;
   return async (plan, prepared, tx, send) => {
     if (!active() || busy) throw new Error('An exchange request is already open or the tab is inactive.');
@@ -224,12 +255,17 @@ export function createExchangeSender({ wallet, chainClient, ledger, active, upda
       }
       if (balance < checked.value + gasLimit * (requestedPrice > price ? requestedPrice : price)) throw new Error('Not enough native currency for the source network fee.');
       if (tokenBalance != null && tokenBalance < tokenAmount(plan.amount)) throw new Error('Not enough of the source token in this wallet.');
+      if (checked.refundsNativeInput || checked.polymerBurnAmount) {
+        await verifyFeeDeployment(client, plan, tx.data.slice(0, 10));
+      }
       const provider = await wallet.getProvider(selected);
       await assertProviderChain(provider, plan.account, plan.fromChain);
+      await verifyPolicy(plan.feePolicy);
       if (!active() || !sameWallet(selected, wallet.getSelection())) throw new Error('The wallet or exchange view changed. Review the route again.');
       validateExchangeRequest(plan, prepared, tx, selected);
-      const record = { ...plan, connectorId: undefined, kind: checked.kind, target: tx.to, value: checked.value.toString(),
-        dataHash: keccak256(tx.data), stage: 'unknown', approvals, reset: checked.reset, hash: null };
+      const record = { ...plan, fee: undefined, feePolicy: undefined, connectorId: undefined, kind: checked.kind, target: tx.to, value: checked.value.toString(),
+        dataHash: keccak256(tx.data), refundsNativeInput: checked.refundsNativeInput || undefined,
+        polymerBurnAmount: checked.polymerBurnAmount, stage: 'unknown', approvals, reset: checked.reset, hash: null };
       ledger.put(record);
       update(record, 'wallet');
       let hash;

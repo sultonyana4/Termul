@@ -1,3 +1,5 @@
+import { assertCurrentFeePolicy, loadFeePolicy } from './fee-policy.js';
+import { TERMUL_FEE_LABEL } from './swap-fee.js';
 import { createPublicClient, formatUnits, http } from 'viem';
 import { arcChain, arcNetwork } from './arc-network.js';
 import { sameWallet } from './wallet-provider.js';
@@ -77,6 +79,8 @@ function render() {
   setText('network-fee', quote?.networkFee == null ? '—' : shortGas(quote.networkFee));
   setText('network-fee-exact', quote?.networkFee == null ? '' : formatGas(quote.networkFee));
   node('fee-details').classList.toggle('hidden', quote?.networkFee == null);
+  setText('termul-fee-label', quote?.feePolicy.bps ? TERMUL_FEE_LABEL : 'Termul fee');
+  setText('termul-fee', quote ? (quote.feePolicy.bps ? tokenAmount(quote.integratorFee, from) + ' (included)' : '0%') : '—');
   setText('provider-fee', quote ? tokenAmount(quote.providerFee, from) : '—');
   setText('status', arcNetwork.error || (historyError ? 'Browser storage is unavailable or the saved swap reference could not be read.'
     : busy ? 'Swap in progress.' : underfunded ? `Not enough ${from.symbol} in your wallet.` : gasShort ? gasMessage
@@ -103,7 +107,10 @@ function updateQuote() {
   } : null);
 }
 
-const requestQuote = createQuoteRequest(fetchSwapQuote, state => {
+const requestQuote = createQuoteRequest(async (input, signal) => {
+  const policy = await loadFeePolicy();
+  return fetchSwapQuote(input, signal, fetch, Date.now, policy);
+}, state => {
   quoteState = state;
   reviewCheck = null;
   const selection = wallet.getSelection();
@@ -250,6 +257,11 @@ $('#swap-form').addEventListener('submit', async event => {
     if (submit.disabled) return;
     const quote = quoteState.quote;
     if (!quote || quote.account.toLowerCase() !== selection.address.toLowerCase()) throw new Error('Wait for a quote for this wallet.');
+    try { await assertCurrentFeePolicy(quote.feePolicy); }
+    catch (error) {
+      updateQuote();
+      throw error;
+    }
     const prepared = await reviewSwap(client, quote);
     if (!visible || pendingReview || !sameWallet(selection, wallet.getSelection()) || quote !== quoteState.quote) return;
     pendingReview = { quote, terms: prepared, selection };
@@ -257,6 +269,8 @@ $('#swap-form').addEventListener('submit', async event => {
     field('receive').textContent = tokenAmount(quote.received, to);
     field('minimum').textContent = tokenAmount(quote.minimum, to);
     field('route').textContent = quote.route;
+    field('termul-fee-label').hidden = field('termul-fee').hidden = !quote.feePolicy.bps;
+    field('termul-fee').textContent = tokenAmount(quote.integratorFee, from) + ' (included)';
     field('provider-fee').textContent = tokenAmount(quote.providerFee, from) + ' (included)';
     field('gas').textContent = shortGas(prepared.gasBudget);
     field('gas-exact').textContent = formatGas(prepared.gasBudget);
