@@ -1,4 +1,4 @@
-import { decodeEventLog, decodeFunctionData, getAddress } from 'viem';
+import { decodeEventLog, decodeFunctionData, encodeFunctionData, getAddress } from 'viem';
 
 const TX_HASH_PATTERN = /\b0x[0-9a-fA-F]{64}\b/;
 
@@ -34,8 +34,16 @@ export function isAmbiguousPaymentError(error) {
 }
 
 export function isDefinitelyNoSubmissionError(error) {
-  return error?.code === 4001 || /(user rejected|user denied|rejected the request|cancelled by user|canceled by user|insufficient funds|execution reverted|invalid params|unsupported method)/i
+  return error?.code === 4001 || isInvoiceReadError(error) || isCircleInvoiceFeeReviewError(error) || /(user rejected|user denied|rejected the request|cancelled by user|canceled by user|insufficient funds|execution reverted|invalid params|unsupported method)/i
     .test(errorText(error));
+}
+
+export function isInvoiceReadError(error) {
+  return ['ARC_DEPLOYMENT_RPC', 'ARC_PREFLIGHT_RPC', 'CIRCLE_FEE_QUOTE_UNAVAILABLE'].includes(error?.code);
+}
+
+export function isCircleInvoiceFeeReviewError(error) {
+  return ['CIRCLE_FEE_REVIEW_STALE', 'CIRCLE_FEE_REVIEW_EXPIRED', 'CIRCLE_FEE_CAP_EXCEEDED'].includes(error?.code);
 }
 
 export function createPaymentSubmissionGate() {
@@ -89,7 +97,8 @@ export function matchesPaymentTransaction(transaction, expected, payer = expecte
     const decoded = decodeFunctionData({ abi: expected.abi, data: input });
     return decoded.functionName === 'payInvoice'
       && getAddress(decoded.args[0]) === getAddress(expected.merchant)
-      && decoded.args[1].toLowerCase() === expected.invoiceId.toLowerCase();
+      && decoded.args[1].toLowerCase() === expected.invoiceId.toLowerCase()
+      && input.toLowerCase() === encodeFunctionData({ abi: expected.abi, functionName: 'payInvoice', args: [expected.merchant, expected.invoiceId] }).toLowerCase();
   } catch {
     return false;
   }
@@ -97,6 +106,7 @@ export function matchesPaymentTransaction(transaction, expected, payer = expecte
 
 function matchingPaymentEvent(logs, expected, payer, transactionHash) {
   if (!Array.isArray(logs)) return null;
+  let match;
   for (const log of logs) {
     try {
       if (log.removed || (log.transactionHash && log.transactionHash.toLowerCase() !== transactionHash.toLowerCase())
@@ -107,12 +117,29 @@ function matchingPaymentEvent(logs, expected, payer, transactionHash) {
         || getAddress(args.merchant) !== getAddress(expected.merchant)
         || getAddress(args.payer) !== getAddress(payer)
         || BigInt(args.amount) !== BigInt(expected.amount)) continue;
-      return args;
+      if (match) return null;
+      match = args;
     } catch {
       // Ignore unrelated logs, but never accept a partially decoded event.
     }
   }
-  return null;
+  return match ?? null;
+}
+
+export function averagePaymentTime(invoices) {
+  const paid = new Map();
+  for (const invoice of invoices) {
+    if (invoice.status !== 'paid' || !invoice.onchainVerified || !invoice.merchant || !invoice.invoiceId
+      || !/^0x[a-f0-9]{64}$/i.test(invoice.createTxHash ?? '') || !/^0x[a-f0-9]{64}$/i.test(invoice.paymentTxHash ?? '')) continue;
+    const key = `${invoice.merchant.toLowerCase()}:${invoice.invoiceId.toLowerCase()}`;
+    const start = Date.parse(invoice.createdBlockTime);
+    const end = Date.parse(invoice.paidBlockTime);
+    if (!paid.has(key)) paid.set(key, null);
+    if (Number.isFinite(start) && Number.isFinite(end) && end >= start) paid.set(key, (end - start) / 1000);
+  }
+  const durations = [...paid.values()].filter(value => value !== null);
+  return { seconds: durations.length ? durations.reduce((sum, value) => sum + value, 0) / durations.length : null,
+    samples: durations.length, eligible: paid.size };
 }
 
 function invoiceHasExpectedIdentity(invoice, expected) {
@@ -120,44 +147,58 @@ function invoiceHasExpectedIdentity(invoice, expected) {
     && BigInt(invoice.amount) === BigInt(expected.amount);
 }
 
-async function proveEventPayment(log, expected, deps, receiptHint = null) {
-  const args = log?.args;
-  if (!args || log.removed || !log.transactionHash
-    || args.invoiceId?.toLowerCase() !== expected.invoiceId.toLowerCase()
-    || getAddress(args.merchant) !== getAddress(expected.merchant)
-    || BigInt(args.amount) !== BigInt(expected.amount)) return null;
-
-  let receipt = receiptHint?.transactionHash?.toLowerCase() === log.transactionHash.toLowerCase()
-    ? receiptHint
-    : null;
-  if (!receipt) {
-    try { receipt = await deps.readReceipt(log.transactionHash); } catch { return null; }
-  }
-  if (receipt?.status !== 'success' || receipt.transactionHash?.toLowerCase() !== log.transactionHash.toLowerCase()
-    || !matchingPaymentEvent(receipt.logs, expected, args.payer, log.transactionHash)) return null;
-
-  let transaction;
-  try { transaction = await deps.readTransaction(log.transactionHash); } catch { return null; }
-  if (!matchesPaymentTransaction(transaction, expected, args.payer)) return null;
-  if (transaction.hash?.toLowerCase() !== log.transactionHash.toLowerCase()) return null;
-
-  return {
-    status: 'paid',
-    invoice: null,
-    paymentTxHash: log.transactionHash,
-    payer: getAddress(args.payer),
-    payerMatchesExpected: expected.payer ? getAddress(args.payer) === getAddress(expected.payer) : null,
-    receiptStatus: 'success',
-    proofUnavailable: false,
-  };
+async function canonicalPaymentBlock(receipt, transaction, deps) {
+  if (typeof receipt.blockNumber !== 'bigint' || !receipt.blockHash || receipt.blockHash !== transaction.blockHash
+    || receipt.blockNumber !== transaction.blockNumber) return null;
+  const [finalized, block] = await Promise.all([deps.readFinalizedBlock(), deps.readBlock(receipt.blockNumber)]);
+  return finalized?.number >= receipt.blockNumber && block?.number === receipt.blockNumber && block.hash === receipt.blockHash ? block : null;
 }
 
-async function findConfirmedPayment(expected, deps, receiptHint = null) {
+export async function verifyRevertedPayment(expected, deps, hash, receiptHint = null) {
+  try {
+    const receipt = receiptHint ?? await deps.readReceipt(hash);
+    if (receipt?.status !== 'reverted' || receipt.transactionHash !== hash) return false;
+    const transaction = await deps.readTransaction(hash);
+    return transaction?.hash === hash && matchesPaymentTransaction(transaction, expected) && Boolean(await canonicalPaymentBlock(receipt, transaction, deps));
+  } catch { return false; }
+}
+
+/** Verify successful payment independently of provider status and log-index freshness. */
+export async function verifyPaymentReceipt(expected, deps, transactionHash, receiptHint = null) {
+  if (!/^0x[a-f0-9]{64}$/i.test(transactionHash ?? '')) return null;
+  try {
+    const hintMatches = receiptHint?.transactionHash?.toLowerCase() === transactionHash.toLowerCase();
+    const [receipt, transaction] = await Promise.all([
+      hintMatches ? receiptHint : deps.readReceipt(transactionHash), deps.readTransaction(transactionHash),
+    ]);
+    if (receipt?.status !== 'success' || receipt.transactionHash?.toLowerCase() !== transactionHash.toLowerCase()
+      || transaction?.hash?.toLowerCase() !== transactionHash.toLowerCase()
+      || !matchesPaymentTransaction(transaction, expected, transaction.from)
+      || !matchingPaymentEvent(receipt.logs, expected, transaction.from, transactionHash)) return null;
+    const block = await canonicalPaymentBlock(receipt, transaction, deps);
+    if (!block) return null;
+    const state = await deps.readInvoiceAt(receipt.blockNumber);
+    if (!invoiceHasExpectedIdentity(state, expected) || Number(state.status) !== Number(expected.status?.paid ?? 2)) return null;
+    const payer = getAddress(transaction.from);
+    return {
+      status: 'paid', paymentTxHash: transactionHash, payer,
+      payerMatchesExpected: expected.payer ? payer === getAddress(expected.payer) : null,
+      receiptStatus: 'success', proofUnavailable: false,
+      ...(typeof block.timestamp === 'bigint' && { paidAt: new Date(Number(block.timestamp) * 1000).toISOString() }),
+    };
+  } catch { return null; }
+}
+
+async function findConfirmedPayment(expected, deps, transactionHash, receiptHint) {
+  const known = transactionHash || receiptHint?.transactionHash;
+  const direct = known && await verifyPaymentReceipt(expected, deps, known, receiptHint);
+  if (direct) return { ...direct, attemptMatchesExpected: true };
   let logs;
   try { logs = await deps.findPaymentLogs(); } catch { return null; }
-  for (const log of logs || []) {
-    const proof = await proveEventPayment(log, expected, deps, receiptHint);
-    if (proof) return proof;
+  for (const hash of new Set((logs || []).filter(log => !log.removed).map(log => log.transactionHash))) {
+    if (hash === known) continue;
+    const proof = await verifyPaymentReceipt(expected, deps, hash);
+    if (proof) return { ...proof, attemptMatchesExpected: !known };
   }
   return null;
 }
@@ -172,9 +213,12 @@ export async function reconcilePaymentAttempt({
   readReceipt,
   readTransaction,
   findPaymentLogs,
+  readFinalizedBlock,
+  readBlock,
+  readInvoiceAt,
   findPendingTransactions,
 }) {
-  const deps = { readReceipt, readTransaction, findPaymentLogs };
+  const deps = { readReceipt, readTransaction, findPaymentLogs, readFinalizedBlock, readBlock, readInvoiceAt };
   let invoice;
   try {
     const chainId = await readChainId();
@@ -194,9 +238,11 @@ export async function reconcilePaymentAttempt({
   const ambiguous = isAmbiguousPaymentError(error);
 
   if (Number(invoice.status) === paidStatus) {
-    const proof = await findConfirmedPayment(expected, deps, receiptHint);
+    const proof = await findConfirmedPayment(expected, deps, transactionHash, receiptHint);
+    const submittedRevertedHash = proof && transactionHash && expected.payer && proof.attemptMatchesExpected === false
+      && await verifyRevertedPayment(expected, deps, transactionHash, receiptHint) ? transactionHash : undefined;
     return proof
-      ? { ...proof, invoice, ambiguous }
+      ? { ...proof, invoice, ambiguous, ...(submittedRevertedHash && { submittedRevertedHash }) }
       : { status: 'paid', invoice, paymentTxHash: null, payer: null, payerMatchesExpected: false, proofUnavailable: true, ambiguous };
   }
 
@@ -205,7 +251,7 @@ export async function reconcilePaymentAttempt({
   }
 
   if (transactionHash || receiptHint || ambiguous) {
-    const proof = await findConfirmedPayment(expected, deps, receiptHint);
+    const proof = await findConfirmedPayment(expected, deps, transactionHash, receiptHint);
     if (proof) return { ...proof, invoice, ambiguous, contractStatePending: true };
   }
 
@@ -220,37 +266,13 @@ export async function reconcilePaymentAttempt({
     const validTransaction = transaction?.hash?.toLowerCase() === transactionHash.toLowerCase()
       && matchesPaymentTransaction(transaction, expected);
     if (validTransaction && receipt.status === 'reverted') {
-      return { status: 'reverted', invoice, paymentTxHash: transactionHash, payer: getAddress(expected.payer), proofUnavailable: false, ambiguous: false };
-    }
-    if (validTransaction && receipt.status === 'success'
-      && matchingPaymentEvent(receipt.logs, expected, expected.payer, transactionHash)) {
-      let refreshed;
-      try { refreshed = await readInvoice(); } catch {
-        return { status: 'unavailable', invoice, paymentTxHash: transactionHash, payer: getAddress(expected.payer), reason: 'post-receipt-contract-read-failed', ambiguous: true };
+      if (await canonicalPaymentBlock(receipt, transaction, deps).catch(() => null)) {
+        return { status: 'reverted', invoice, paymentTxHash: transactionHash, payer: getAddress(expected.payer), proofUnavailable: false, ambiguous: false };
       }
-      if (!invoiceHasExpectedIdentity(refreshed, expected)) {
-        return { status: 'unavailable', invoice: refreshed, paymentTxHash: null, reason: 'invoice-mismatch', ambiguous: true };
-      }
-      if (Number(refreshed.status) === paidStatus) {
-        return { status: 'paid', invoice: refreshed, paymentTxHash: transactionHash, payer: getAddress(expected.payer), payerMatchesExpected: true, receiptStatus: 'success', proofUnavailable: false, ambiguous };
-      }
-      if (Number(refreshed.status) !== openStatus) {
-        return { status: 'inconsistent', invoice: refreshed, paymentTxHash: null, reason: 'contradictory-contract-status', ambiguous: true };
-      }
-      return {
-        status: 'paid',
-        invoice: refreshed,
-        paymentTxHash: transactionHash,
-        payer: getAddress(expected.payer),
-        payerMatchesExpected: true,
-        receiptStatus: 'success',
-        proofUnavailable: false,
-        ambiguous: true,
-        contractStatePending: true,
-      };
     }
     if (validTransaction && receipt.status === 'success') {
-      return { status: 'unmatched', invoice, paymentTxHash: transactionHash, payer: getAddress(expected.payer), proofUnavailable: false, ambiguous: true };
+      const status = matchingPaymentEvent(receipt.logs, expected, expected.payer, transactionHash) ? 'pending' : 'unmatched';
+      return { status, invoice, paymentTxHash: transactionHash, payer: getAddress(expected.payer), proofUnavailable: false, ambiguous: true };
     }
   }
 

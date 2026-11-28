@@ -1,5 +1,6 @@
 import { defineChain, keccak256 } from 'viem';
 import { TERMUL_MAINNET } from '../supabase/functions/_shared/termul-mainnet.js';
+import { checkArcDeployment } from './arc-read.js';
 
 export const arcChain = defineChain({
   id: TERMUL_MAINNET.id,
@@ -31,19 +32,10 @@ export function resolveArcNetwork(env = {}) {
 
 export async function verifyInvoiceDeployment(client, network) {
   if (network.error) throw new Error(network.error);
-  if (await client.getChainId() !== network.chain.id) throw new Error('The RPC returned the wrong Arc Mainnet chain ID.');
-  const address = network.contractAddress;
-  const [latest, deployed, previous] = await Promise.all([
-    client.getCode({ address }),
-    client.getCode({ address, blockNumber: network.deploymentBlock }),
-    client.getCode({ address, blockNumber: network.deploymentBlock - 1n }),
-  ]);
-  const matchesRuntime = (code) => typeof code === 'string' && /^0x(?:[0-9a-f]{2})+$/i.test(code)
-    && keccak256(code) === network.runtimeHash;
-  if (!matchesRuntime(latest)) throw new Error('The latest TermulInvoices runtime bytecode does not match the verified deployment.');
-  if (!matchesRuntime(deployed) || (previous !== undefined && previous !== '0x')) {
-    throw new Error('TermulInvoices bytecode does not match the verified deployment block.');
-  }
+  const status = await checkArcDeployment(client, network, code => /^0x(?:[0-9a-f]{2})+$/i.test(code ?? '') ? keccak256(code) : null);
+  if (status === 'wrong-chain') throw new Error('The RPC returned the wrong Arc Mainnet chain ID.');
+  if (status === 'current-mismatch') throw new Error('The latest TermulInvoices runtime bytecode does not match the verified deployment.');
+  if (status !== 'verified') throw new Error('TermulInvoices bytecode does not match the verified deployment block.');
 }
 
 export function validatePaymentLinkNetwork(params, network) {

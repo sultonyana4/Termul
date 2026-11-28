@@ -33,11 +33,49 @@
  <p id="wallet-none" hidden>No compatible browser wallet detected. Open Termul in your wallet browser or enable a wallet extension.</p>
  <p id="wallet-connect-status" role="status"></p>
 </dialog>
+<dialog id="circle-login-dialog" class="account-dialog" aria-labelledby="circle-login-title">
+ <div class="wallet-dialog-heading"><h2 id="circle-login-title">Continue with Email</h2><form method="dialog"><button class="btn btn-quiet btn-sm">Close</button></form></div>
+ <form id="circle-email-form">
+  <label for="circle-email">Email address</label>
+  <input id="circle-email" name="email" type="email" autocomplete="email" required>
+  <button class="btn btn-primary btn-sm" type="submit">Request verification code</button>
+ </form>
+ <button id="circle-otp-continue" class="btn btn-primary btn-sm" type="button" hidden>Enter code in Circle</button>
+ <button id="circle-initialize" class="btn btn-primary btn-sm" type="button" hidden>Approve wallet creation</button>
+ <button id="circle-refresh" class="btn btn-quiet btn-sm" type="button" hidden>Check wallet status</button>
+ <p id="circle-login-status" class="hint" role="status"></p>
+</dialog>
+<dialog id="circle-review-dialog" class="account-dialog" aria-labelledby="circle-review-title">
+ <h2 id="circle-review-title">Review Circle transaction</h2>
+ <p id="circle-review-notice" class="hint" role="status" hidden></p>
+ <div id="circle-review-assets" class="receipt-assets" hidden></div>
+ <div id="circle-swap-review-terms" hidden></div>
+ <pre id="circle-review-details"></pre>
+ <form method="dialog" class="wallet-dialog-heading">
+  <button class="btn btn-quiet" value="cancel" autofocus>Cancel</button>
+  <button class="btn btn-primary" value="continue">Continue to Circle</button>
+ </form>
+</dialog>
+<dialog id="circle-arc-token-picker" class="account-dialog" aria-labelledby="circle-arc-token-title">
+ <div class="circle-token-picker-header">
+ <div class="account-header"><h2 id="circle-arc-token-title">Select Arc token</h2><button type="button" class="btn btn-quiet" data-token-close>Close</button></div>
+ <label for="circle-arc-token-search">Search by name, symbol, or contract address</label>
+ <input class="field" id="circle-arc-token-search" type="search" maxlength="160" autocomplete="off">
+ <p class="hint">LI.FI catalog tokens are discoverable. Termul checks route availability and token contracts at review.</p>
+ </div>
+ <p class="hint" role="status"></p>
+ <ul class="circle-token-list"></ul>
+ <button type="button" class="btn btn-quiet" data-token-more hidden>Show more tokens</button>
+</dialog>
 <dialog id="account-dialog" class="account-dialog" aria-labelledby="profile-name">
  <div class="account-header"><h2 id="profile-name">Wallet account</h2><form method="dialog"><button class="btn btn-quiet btn-sm" autofocus>Close</button></form></div>
  <span class="pill"><i class="network-orb" aria-hidden="true"></i> <span data-arc-name>Arc Mainnet</span></span>
  <div id="wallet-address-list" class="account-address"><span class="mono" id="account-address"></span><button class="btn btn-quiet btn-sm" data-copy-wallet type="button">Copy address</button></div>
  <p class="hint" id="account-access"></p>
+ <button type="button" class="btn btn-quiet btn-sm" id="wallet-switch-choice" hidden>Change wallet</button>
+ <button type="button" class="btn btn-quiet btn-sm" id="circle-check-attempt" hidden>Check Circle attempt</button>
+ <p class="hint" id="circle-attempt-status" role="status" hidden></p>
+ <details id="circle-history" hidden><summary>Circle transactions</summary><ul id="circle-history-list"></ul></details>
  <button class="btn btn-primary btn-sm hidden" id="account-verify-wallet" data-verify-wallet type="button">Verify wallet</button>
  <button class="btn btn-quiet btn-sm hidden" id="switch-wallet-network" data-switch-network type="button">Switch to Arc Mainnet</button>
  <form id="display-name-form" class="account-name hidden">
@@ -116,18 +154,20 @@
  <div class="page-heading swap-heading"><div><h1>Swap</h1><p>Exchange USDC and EURC from your wallet.</p></div><span class="pill chain-badge"><i class="network-orb" aria-hidden="true"></i> Arc Mainnet</span></div>
  <div class="swap-layout">
   <form class="panel swap-panel" id="swap-form">
+   <p class="hint" id="circle-arc-gas-balance" hidden>Network fee balance unavailable</p>
    <div class="swap-token-row">
     <label for="swap-input">Send</label>
-    <div class="swap-amount-row"><input id="swap-input" class="field" inputmode="decimal" placeholder="0.00" maxlength="79" autocomplete="off"><span class="token-label"><img data-swap="from-icon" class="token-icon" src="/brand/usdc.svg" alt="" width="32" height="32"><strong data-swap="from">USDC</strong></span></div>
+    <div class="swap-amount-row"><input id="swap-input" class="field" inputmode="decimal" placeholder="0.00" maxlength="79" autocomplete="off"><span class="token-label" data-swap="from-fixed"><img data-swap="from-icon" class="token-icon" src="/brand/usdc.svg" alt="" width="32" height="32"><strong data-swap="from">USDC</strong></span><button type="button" class="btn btn-quiet circle-token-choice" id="circle-arc-from" aria-haspopup="dialog" hidden></button></div>
     <div class="swap-balance"><span>Balance <span data-swap="input-balance">—</span></span><button class="btn btn-quiet btn-sm" id="swap-max" type="button" disabled>Max</button></div>
    </div>
    <button class="btn btn-quiet swap-direction" id="swap-direction" type="button" aria-label="Switch swap direction"><span aria-hidden="true">↓↑</span></button>
    <div class="swap-token-row">
     <span>Receive <span class="hint">(estimated)</span></span>
-    <div class="swap-amount-row"><output data-swap="output" for="swap-input">—</output><span class="token-label"><img data-swap="to-icon" class="token-icon" src="/brand/eurc.svg" alt="" width="32" height="32"><strong data-swap="to">EURC</strong></span></div>
+    <div class="swap-amount-row"><output data-swap="output" for="swap-input">—</output><span class="token-label" data-swap="to-fixed"><img data-swap="to-icon" class="token-icon" src="/brand/eurc.svg" alt="" width="32" height="32"><strong data-swap="to">EURC</strong></span><button type="button" class="btn btn-quiet circle-token-choice" id="circle-arc-to" aria-haspopup="dialog" hidden></button></div>
     <div class="swap-balance"><span>Balance <span data-swap="output-balance">—</span></span></div>
    </div>
    <p class="hint" data-swap="status" role="status">Enter an amount to see a quote.</p>
+   <ol id="circle-swap-progress" class="circle-swap-progress" aria-label="Circle swap progress" hidden></ol>
    <button class="btn btn-primary swap-submit" data-swap="submit" type="submit">Connect wallet</button>
   </form>
   <aside class="panel swap-panel" aria-labelledby="swap-quote-title">
@@ -154,7 +194,7 @@
  </div>
  </section>
  <section id="any-token-panel" role="tabpanel" aria-labelledby="any-token-tab" hidden>
-  <div class="page-heading swap-heading"><div><h1>Any Token</h1><p>Swap tokens and move funds between supported networks.</p></div></div>
+  <div class="page-heading swap-heading"><div><h1>Any Token</h1><p id="exchange-description">Swap tokens and move funds between supported networks.</p></div></div>
   <div class="any-token-content">
    <p id="exchange-load-status" class="hint" role="status">Loading exchange…</p>
    <button id="exchange-load-retry" type="button" class="btn btn-quiet hidden">Try again</button>
@@ -164,7 +204,44 @@
     <div><span>Receive</span><strong data-exchange-network="to"></strong></div>
    </div>
    <p id="exchange-termul-fee" class="hint" hidden></p>
+   <div id="exchange-wallet-alternative" hidden><button class="btn btn-quiet" type="button">Choose external wallet</button></div>
    <div id="exchange-widget"></div>
+   <div id="circle-arc-exchange" hidden></div>
+   <details id="circle-transfer-recovery" hidden>
+    <summary>Previous Circle transfers</summary>
+   <section id="circle-lifi" class="panel exchange-recovery" aria-label="Circle LI.FI" hidden>
+    <h2>LI.FI transfer history</h2>
+    <form id="circle-lifi-form" hidden inert>
+     <label for="circle-lifi-from">Send from</label>
+     <select id="circle-lifi-from" class="field"></select>
+     <label for="circle-lifi-to">Receive on</label>
+     <select id="circle-lifi-to" class="field"></select>
+     <label for="circle-lifi-amount">LI.FI USDC amount</label>
+     <input id="circle-lifi-amount" class="field" type="text" inputmode="decimal" autocomplete="off" required>
+     <button class="btn btn-primary btn-sm" type="submit">Review LI.FI step</button>
+    </form>
+    <p id="circle-lifi-status" class="hint" role="status"></p>
+    <div class="transaction-actions">
+     <button id="circle-lifi-refresh" class="btn btn-quiet btn-sm" type="button">Check LI.FI history</button>
+     <button id="circle-lifi-close" class="btn btn-quiet btn-sm" type="button" hidden>Close LI.FI review</button>
+    </div>
+    <ul id="circle-lifi-history" aria-label="Circle LI.FI transactions"></ul>
+   </section>
+   <section id="circle-bridge" class="panel exchange-recovery" aria-label="Circle bridge" hidden>
+    <h2>CCTP transfer history</h2>
+    <form id="circle-bridge-form" hidden inert>
+     <label for="circle-bridge-amount">USDC to send</label>
+     <input id="circle-bridge-amount" class="field" type="text" inputmode="decimal" autocomplete="off" required>
+     <button class="btn btn-primary btn-sm" type="submit">Review next step</button>
+    </form>
+    <p id="circle-bridge-status" class="hint" role="status"></p>
+    <div class="transaction-actions">
+     <button id="circle-bridge-refresh" class="btn btn-quiet btn-sm" type="button">Check status and history</button>
+     <button id="circle-bridge-close" class="btn btn-quiet btn-sm" type="button" hidden>Close unsubmitted route</button>
+    </div>
+    <ul id="circle-bridge-history" aria-label="Bridge transactions"></ul>
+   </section>
+   </details>
    <section id="exchange-recovery" class="panel exchange-recovery hidden" aria-label="Latest exchange">
     <h2>Latest exchange</h2>
     <p id="exchange-stage" class="hint" role="status"></p>
@@ -203,7 +280,7 @@
 <article class="metric-card"><div class="metric-head">Total received <span class="metric-icon"><svg viewBox="0 0 24 24" fill="none"><path d="M4 17 10 11l4 4 6-8M14 7h6v6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></span></div><div class="metric-value"><span id="received-total">—</span><span style="font-size:13px;color:#9ca9bb"> USDC</span></div><div class="metric-foot" id="received-foot">Connect a wallet to sync invoice payments</div></article>
 <article class="metric-card"><div class="metric-head">Outstanding <span class="metric-icon" style="color:var(--amber);background:rgba(242,200,115,.09)"><svg viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.8"/><path d="M12 7v5l3 2" stroke="currentColor" stroke-width="1.8"/></svg></span></div><div class="metric-value"><span id="outstanding-total">—</span><span style="font-size:13px;color:#9ca9bb"> USDC</span></div><div class="metric-foot">Across <span id="pending-count">—</span> open invoices on Arc</div></article>
 <article class="metric-card"><div class="metric-head">Confirmed payments <span class="metric-icon" style="color:var(--green);background:rgba(131,230,173,.08)"><svg viewBox="0 0 24 24" fill="none"><path d="m5 12 4 4L19 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.5"/></svg></span></div><div class="metric-value" id="paid-count">—</div><div class="metric-foot">Receipt, event, and state verified</div></article>
-<article class="metric-card"><div class="metric-head">Avg. payment time <span class="metric-icon" style="color:var(--violet);background:rgba(145,133,255,.1)"><svg viewBox="0 0 24 24" fill="none"><path d="M12 8v4l3 2M21 12a9 9 0 1 1-2.6-6.4M21 4v5h-5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></span></div><div class="metric-value"><span id="avg-payment-time">—</span><span style="font-size:13px;color:#9ca9bb"> days</span></div><div class="metric-foot">Not available yet</div></article>
+<article class="metric-card"><div class="metric-head">Avg. payment time <span class="metric-icon" style="color:var(--violet);background:rgba(145,133,255,.1)"><svg viewBox="0 0 24 24" fill="none"><path d="M12 8v4l3 2M21 12a9 9 0 1 1-2.6-6.4M21 4v5h-5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></span></div><div class="metric-value"><span id="avg-payment-time">—</span></div><div class="metric-foot" id="avg-payment-foot">Awaiting verified payments</div></article>
 <article class="metric-card"><div class="metric-head">Wallet balance <span class="metric-icon"><svg viewBox="0 0 24 24" fill="none"><rect x="3" y="5" width="18" height="14" rx="3" stroke="currentColor" stroke-width="1.8"/><path d="M3 9h18M15.5 14h2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg></span></div><div class="metric-value"><span id="wallet-balance">—</span><span style="font-size:13px;color:#9ca9bb"> USDC</span></div><div class="metric-foot" style="display:flex;justify-content:space-between;align-items:center;gap:6px"><span id="wallet-balance-state" aria-live="polite">Connect a wallet to read its balance.</span><button class="table-link" id="refresh-chain-sync" type="button">Refresh</button></div></article>
 </div>
 <div class="dashboard-grid"><section class="panel"><div class="panel-head"><div><h2>Invoices</h2><p>On-chain records for the connected wallet. <span id="invoice-sync-status" role="status" aria-live="polite">Connect a wallet to sync Arc invoices.</span></p></div><button class="btn btn-quiet btn-sm" data-nav="create">Create invoice <span>→</span></button></div><div class="panel-body table-wrap"><div id="invoice-empty" class="empty-state"><strong>Connect a wallet</strong><span>Invoice data appears after a successful <span data-arc-name>Arc Mainnet</span> sync.</span><button class="btn btn-primary btn-sm" data-nav="create">Create invoice</button></div><table id="invoice-table" class="invoice-table hidden"><thead><tr><th>Client</th><th>Amount</th><th>Status</th><th>Due date</th><th></th></tr></thead><tbody id="invoice-rows"></tbody></table></div></section>
@@ -261,7 +338,7 @@ function navigate(target){
   $('#switch-for-workspace').classList.toggle('hidden',!connectedWallet||connectedWallet.chainId===5042);
  }
  if(paymentRoute){updatePayment();return}
- if(target==='dashboard')renderDashboard();
+ if(target==='dashboard'){renderDashboard();if(changed&&authorized)window.arusPayRefreshSync?.()}
  if(target==='create'&&authorized)updatePreview();
 }
 function renderDashboard(){
@@ -270,28 +347,32 @@ function renderDashboard(){
  const amountsValid=verifiedInvoices.every(invoice=>invoiceBase(invoice)!==null);
  const displayState=!hasMerchantAccess()?'disconnected':invoiceSyncState==='success'&&!amountsValid?'invalid':invoiceSyncState;
  const dataAvailable=displayState==='success';
- const visibleInvoices=dataAvailable?verifiedInvoices:[];
+ const visibleInvoices=dataAvailable||displayState==='partial'?verifiedInvoices:[];
  rows.innerHTML='';
  if(visibleInvoices.length){
   empty.classList.add('hidden');table.classList.remove('hidden');
   visibleInvoices.forEach(invoice=>{const row=document.createElement('tr');row.innerHTML=`<td><div class="client"><span class="client-icon">${escapeHtml(invoice.initials)}</span><span>${escapeHtml(invoice.name)}</span></div><span class="invoice-id">${escapeHtml(invoice.id)}</span></td><td>${usdInvoice(invoice)} <span style="color:#7f8ba0">USDC</span></td><td><span class="status ${invoice.status==='paid'?'paid':invoice.status==='cancelled'||invoice.status==='expired'?'overdue':'pending'}"><i style="width:5px;height:5px;border-radius:50%;background:currentColor"></i>${invoice.status==='paid'?'Paid':invoice.status==='cancelled'?'Cancelled':invoice.status==='expired'?'Expired':'Open on Arc'}</span></td><td>${escapeHtml(formatDate(invoice.due))}</td><td><button class="table-link" data-open-invoice="${escapeHtml(invoice.id)}">Open →</button></td>`;rows.appendChild(row)});
  }else{
   empty.classList.remove('hidden');table.classList.add('hidden');
-  const messages={loading:[`Syncing ${arcNetworkName()}`,'Checking invoice records from the deployed invoice contract.'],error:['Invoice sync unavailable','Could not verify invoice data. Refresh to retry.'],success:['No invoices yet',`No invoice events were found for this wallet on ${arcNetworkName()}.`],disconnected:['Connect a wallet',`Invoice data appears after a successful ${arcNetworkName()} sync.`],invalid:['Invoice data unavailable','A verified on-chain amount could not be parsed. Refresh to retry.']};
+  const messages={loading:[`Syncing ${arcNetworkName()}`,'Checking invoice records from the deployed invoice contract.'],error:['Invoice sync unavailable','Could not verify invoice data. Refresh to retry.'],partial:['Invoice history is still syncing','Verified invoices appear as they are indexed.'],success:['No invoices yet',`No invoice events were found for this wallet on ${arcNetworkName()}.`],disconnected:['Connect a wallet',`Invoice data appears after a successful ${arcNetworkName()} sync.`],invalid:['Invoice data unavailable','A verified on-chain amount could not be parsed. Refresh to retry.']};
   const [title,description]=messages[displayState]||messages.disconnected;
   empty.querySelector('strong').textContent=title;empty.querySelector('span').textContent=description;
  }
  const openInvoices=visibleInvoices.filter(invoice=>invoice.status==='open'),paidInvoices=visibleInvoices.filter(invoice=>invoice.status==='paid');
  const outstandingBase=openInvoices.reduce((sum,invoice)=>sum+invoiceBase(invoice),0n),receivedBase=paidInvoices.reduce((sum,invoice)=>sum+invoiceBase(invoice),0n);
- $('#received-total').textContent=dataAvailable?usdBase(receivedBase):'—';$('#outstanding-total').textContent=dataAvailable?usdBase(outstandingBase):'—';$('#pending-count').textContent=dataAvailable?String(openInvoices.length):'—';$('#paid-count').textContent=dataAvailable?String(paidInvoices.length):'—';$('#avg-payment-time').textContent='—';
- const footMessages={loading:`Syncing invoice events from ${arcNetworkName()}…`,error:'Unavailable · refresh to retry',disconnected:'Connect a wallet to sync invoice payments',invalid:'Unavailable · verified invoice amount could not be parsed'};
+ $('#received-total').textContent=dataAvailable?usdBase(receivedBase):'—';$('#outstanding-total').textContent=dataAvailable?usdBase(outstandingBase):'—';$('#pending-count').textContent=dataAvailable?String(openInvoices.length):'—';$('#paid-count').textContent=dataAvailable?String(paidInvoices.length):'—';const average=dataAvailable?window.arusPayAveragePaymentTime?.(paidInvoices):null;
+ const seconds=average?.seconds==null?null:Math.round(average.seconds);
+ $('#avg-payment-time').textContent=seconds===null?'—':seconds<60?seconds+' s':Math.floor(seconds/60)+' min '+(seconds%60)+' s';
+ $('#avg-payment-foot').textContent=!dataAvailable?'Awaiting complete sync':seconds===null?'No verified payment durations':
+  average.samples===average.eligible?`${average.samples} verified payment${average.samples===1?'':'s'}`:`${average.samples} of ${average.eligible} payments have verified timestamps`;
+ const footMessages={loading:`Syncing invoice events from ${arcNetworkName()}…`,error:'Unavailable · refresh to retry',partial:'Totals pending · showing verified history',disconnected:'Connect a wallet to sync invoice payments',invalid:'Unavailable · verified invoice amount could not be parsed'};
  $('#received-foot').textContent=dataAvailable?(paidInvoices.length?`Confirmed on ${arcNetworkName()}`:'No confirmed payments'):footMessages[displayState]||footMessages.disconnected;
  const paymentActivity=$('#payment-activity-empty');
- if(!dataAvailable){const messages={loading:['Syncing payment activity','Waiting for an on-chain invoice read.'],error:['Payment activity unavailable','Could not verify payment data. Refresh to retry.'],disconnected:['Connect a wallet',`Confirmed activity appears after a successful ${arcNetworkName()} sync.`],invalid:['Payment activity unavailable','A verified invoice amount could not be parsed.']};const [title,description]=messages[displayState]||messages.disconnected;paymentActivity.classList.add('empty-state');paymentActivity.innerHTML=`<strong>${title}</strong><span>${description}</span>`}
+ if(!dataAvailable&&!paidInvoices.length){const messages={partial:['Invoice history is still syncing','Verified payments appear as they are indexed.'],loading:['Syncing payment activity','Waiting for an on-chain invoice read.'],error:['Payment activity unavailable','Could not verify payment data. Refresh to retry.'],disconnected:['Connect a wallet',`Confirmed activity appears after a successful ${arcNetworkName()} sync.`],invalid:['Payment activity unavailable','A verified invoice amount could not be parsed.']};const [title,description]=messages[displayState]||messages.disconnected;paymentActivity.classList.add('empty-state');paymentActivity.innerHTML=`<strong>${title}</strong><span>${description}</span>`}
  else{paymentActivity.classList.toggle('empty-state',!paidInvoices.length);paymentActivity.innerHTML=paidInvoices.length?paidInvoices.map(invoice=>`<div class="activity-item"><span class="activity-mark">✓</span><div class="activity-copy"><strong>Payment confirmed</strong><span>${escapeHtml(invoice.id)} · <a class="table-link" href="${escapeHtml(invoice.paymentExplorerUrl)}" target="_blank" rel="noreferrer">View receipt</a></span></div><span class="activity-amount">${usdInvoice(invoice)} USDC</span></div>`).join(''):'<strong>No confirmed payment activity</strong><span>Confirmed payment data will appear here.</span>'}
- const events=dataAvailable?visibleInvoices.filter(invoice=>invoice.createdAt).map(invoice=>({at:invoice.createdAt,name:invoice.name,id:invoice.id,amount:invoice.amount,amountBase:invoice.amountBase})):[];
+ const events=visibleInvoices.length?visibleInvoices.filter(invoice=>invoice.createdAt).map(invoice=>({at:invoice.createdAt,name:invoice.name,id:invoice.id,amount:invoice.amount,amountBase:invoice.amountBase})):[];
  events.sort((a,b)=>new Date(b.at)-new Date(a.at));const activity=$('#activity-list');
- if(!dataAvailable){const messages={loading:['Syncing Arc activity','Checking the deployed invoice contract.'],error:['Arc activity unavailable','Could not verify invoice activity. Refresh to retry.'],disconnected:['Connect a wallet',`Activity appears after a successful ${arcNetworkName()} sync.`],invalid:['Arc activity unavailable','A verified invoice amount could not be parsed.']};const [title,description]=messages[displayState]||messages.disconnected;activity.innerHTML=`<div class="empty-state"><strong>${title}</strong><span>${description}</span></div>`}
+ if(!dataAvailable&&!events.length){const messages={partial:['Invoice history is still syncing','Verified events appear as they are indexed.'],loading:['Syncing Arc activity','Checking the deployed invoice contract.'],error:['Arc activity unavailable','Could not verify invoice activity. Refresh to retry.'],disconnected:['Connect a wallet',`Activity appears after a successful ${arcNetworkName()} sync.`],invalid:['Arc activity unavailable','A verified invoice amount could not be parsed.']};const [title,description]=messages[displayState]||messages.disconnected;activity.innerHTML=`<div class="empty-state"><strong>${title}</strong><span>${description}</span></div>`}
  else if(!events.length){activity.innerHTML='<div class="empty-state"><strong>No activity yet</strong><span>Confirmed on-chain actions will appear here.</span></div>'}
  else{activity.innerHTML=events.map(event=>`<div class="activity-item"><span class="activity-mark">↗</span><div class="activity-copy"><strong>Invoice created for ${escapeHtml(event.name)}</strong><span>${escapeHtml(formatTimestamp(event.at))} · ${escapeHtml(event.id)}</span></div><span class="activity-amount">${usdInvoice(event)} USDC</span></div>`).join('')}
  $$('[data-open-invoice]').forEach(button=>button.addEventListener('click',()=>{selectedInvoice=visibleInvoices.find(invoice=>invoice.id===button.dataset.openInvoice)||null;navigate('payment')}))
@@ -365,8 +446,8 @@ window.termulSessionChanged=()=>{
   resetInvoiceForm();
  }
  void loadProfile();
- window.arusPayRefreshSync?.();
  navigate(currentView);
+ window.arusPayRefreshSync?.();
 };
 $$('[data-nav]').forEach(element=>element.addEventListener('click',event=>{
  event.preventDefault();
@@ -449,7 +530,7 @@ $('#add-line').addEventListener('click',()=>{const line=document.createElement('
 function resetInvoiceForm(){const form=$('#invoice-form');form.reset();$$('#line-items .line-item').slice(1).forEach(line=>line.remove());const first=$$('#line-items .line-item')[0];first.querySelector('.item-qty').value='1';first.querySelector('.item-description').value='';first.querySelector('.item-price').value='';updatePreview()}
 $('#invoice-form').addEventListener('submit',event=>{event.preventDefault();if(!hasMerchantAccess())return navigate('create');if(window.arusPayCreateInvoice)window.arusPayCreateInvoice();else showToast(`${arcNetworkName()} integration is unavailable. No transaction was sent.`)});
 const sameInvoice=(left,right)=>Boolean(left?.invoiceId&&right?.invoiceId&&left.invoiceId.toLowerCase()===right.invoiceId.toLowerCase()&&left.merchant?.toLowerCase()===right.merchant?.toLowerCase());
-window.arusPayApi={getInvoices:()=>hasMerchantAccess()?invoices:[],getSelectedInvoice:()=>selectedInvoice,setInvoiceSyncState(state){if(!['loading','success','error','disconnected'].includes(state))return;invoiceSyncState=state;renderDashboard()},replaceInvoices(nextInvoices){if(!hasMerchantAccess())return;invoiceSyncState='success';invoices=nextInvoices;const linkedParams=new URL(window.location.href).searchParams;const linkedSelection=sharedInvoiceLink&&selectedInvoice?.invoiceId?.toLowerCase()===linkedParams.get('invoiceId')?.toLowerCase()&&selectedInvoice?.merchant?.toLowerCase()===linkedParams.get('merchant')?.toLowerCase();if(!invoices.length&&!linkedSelection)selectedInvoice=null;else if(selectedInvoice?.invoiceId)selectedInvoice=invoices.find(item=>sameInvoice(item,selectedInvoice))||selectedInvoice;renderDashboard()},clearInvoices(preserveSelection=false){invoices=[];const params=new URL(window.location.href).searchParams;const merchant=params.get('merchant'),invoiceId=params.get('invoiceId');selectedInvoice=preserveSelection&&sameInvoice(selectedInvoice,{merchant,invoiceId})?{merchant,invoiceId}:null;invoiceSyncState='disconnected';renderDashboard()},addInvoice(invoice){if(!hasMerchantAccess())return;invoices.unshift(invoice);selectedInvoice=invoice;renderDashboard();navigate('payment')},updateInvoice(merchant,invoiceId,updates){const target={merchant,invoiceId};const existing=invoices.find(item=>sameInvoice(item,target));if(existing){Object.assign(existing,updates);if(sameInvoice(selectedInvoice,target))selectedInvoice=existing;renderDashboard()}},openInvoice(invoice){const existing=invoices.find(item=>sameInvoice(item,invoice));selectedInvoice=existing||invoice;navigate('payment')},navigate};
+window.arusPayApi={getInvoices:()=>hasMerchantAccess()?invoices:[],getSelectedInvoice:()=>selectedInvoice,setInvoiceSyncState(state){if(!['loading','success','partial','error','disconnected'].includes(state))return;invoiceSyncState=state;renderDashboard()},replaceInvoices(nextInvoices,state='success'){if(!hasMerchantAccess())return;invoiceSyncState=state;invoices=nextInvoices;const linkedParams=new URL(window.location.href).searchParams;const linkedSelection=sharedInvoiceLink&&selectedInvoice?.invoiceId?.toLowerCase()===linkedParams.get('invoiceId')?.toLowerCase()&&selectedInvoice?.merchant?.toLowerCase()===linkedParams.get('merchant')?.toLowerCase();if(!invoices.length&&!linkedSelection)selectedInvoice=null;else if(selectedInvoice?.invoiceId)selectedInvoice=invoices.find(item=>sameInvoice(item,selectedInvoice))||selectedInvoice;renderDashboard()},clearInvoices(preserveSelection=false){invoices=[];const params=new URL(window.location.href).searchParams;const merchant=params.get('merchant'),invoiceId=params.get('invoiceId');selectedInvoice=preserveSelection&&sameInvoice(selectedInvoice,{merchant,invoiceId})?{merchant,invoiceId}:null;invoiceSyncState='disconnected';renderDashboard()},addInvoice(invoice){if(!hasMerchantAccess())return;invoices.unshift(invoice);selectedInvoice=invoice;renderDashboard();navigate('payment')},updateInvoice(merchant,invoiceId,updates){const target={merchant,invoiceId};const existing=invoices.find(item=>sameInvoice(item,target));if(existing){Object.assign(existing,updates);if(sameInvoice(selectedInvoice,target))selectedInvoice=existing;renderDashboard()}},openInvoice(invoice){const existing=invoices.find(item=>sameInvoice(item,invoice));selectedInvoice=existing||invoice;navigate('payment')},navigate};
 navigate(sharedInvoiceLink?'payment':'dashboard');
 </script>
 <script type="module" src="/src/arc-invoices.js"></script>

@@ -1,0 +1,11 @@
+:root { color-scheme: light dark; font: 16px/1.5 system-ui, sans-serif; }
+body { margin: 0; }
+main { max-width: 45rem; margin: 8vh auto; padding: 0 1rem; }
+form label { display: block; margin-bottom: .3rem; }
+button, input { font: inherit; padding: .45rem .65rem; margin: 0 .25rem .5rem 0; }
+input { max-width: 100%; box-sizing: border-box; }
+section { border-block: 1px solid GrayText; padding-block: .5rem; margin-block: .5rem; }
+dt { font-weight: 650; }
+dd { margin: 0 0 .7rem; overflow-wrap: anywhere; }
+pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+[hidden] { display: none !important; }

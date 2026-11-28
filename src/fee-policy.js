@@ -4,6 +4,7 @@ export const TERMUL_FEE_RECIPIENT = '0xeE640148243089B7C0674ABF4DFA116aAF919BF9'
 export const FEE_POLICY_FILE = 'termul-fee-policy.json';
 export const FEE_POLICY_CHECK = '/api/termul-fee-policy';
 export const FEE_POLICY_ORIGIN = TERMUL_MAINNET.origin;
+export const LOCAL_FEE_POLICY_ORIGIN = 'http://localhost:5173';
 
 export function parseFeePolicy(value) {
   if (!value || Object.keys(value).length !== 3 || !['version', 'bps', 'recipient'].every(key => Object.hasOwn(value, key))
@@ -53,7 +54,8 @@ export async function loadFeePolicy(fetcher = fetch, origin = globalThis.locatio
     const [manifest, live] = await Promise.all([read('/' + FEE_POLICY_FILE, false), read(FEE_POLICY_CHECK)]);
     const policy = parseFeePolicy(manifest);
     if (live?.check !== check || Object.keys(live).length !== 2 || !sameFeePolicy(policy, parseFeePolicy(live.policy))) throw new Error('Stale fee policy.');
-    if (policy.bps && origin !== FEE_POLICY_ORIGIN) throw new Error('Invalid fee origin.');
+    const local = import.meta.env && import.meta.env.TERMUL_LOCAL_CIRCLE === true && origin === LOCAL_FEE_POLICY_ORIGIN;
+    if (policy.bps && origin !== FEE_POLICY_ORIGIN && !local) throw new Error('Invalid fee origin.');
     return policy;
   } catch {
     throw new Error(policyUnavailable);

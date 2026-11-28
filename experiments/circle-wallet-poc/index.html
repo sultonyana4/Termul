@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Termul Circle Wallet PoC</title>
+  <link rel="stylesheet" href="/style.css">
+  <script type="module" src="/browser.js"></script>
+</head>
+<body>
+  <main>
+    <h1>Termul Circle Wallet PoC</h1>
+    <p>Use the operator-approved email to test an Arc Mainnet wallet.</p>
+    <form id="email-form" hidden>
+      <label for="email">Email address</label>
+      <input id="email" type="email" autocomplete="email" maxlength="254" required>
+      <button type="submit">Request OTP</button>
+    </form>
+    <button id="verify" hidden>Enter OTP in Circle</button>
+    <button id="refresh" hidden>Refresh wallet</button>
+    <button id="initialize" hidden>Approve Arc EOA creation in Circle</button>
+    <section id="wallet" aria-label="Wallet details" hidden>
+      <dl>
+        <dt>Wallet ID</dt><dd id="wallet-id"></dd>
+        <dt>Address</dt><dd id="wallet-address"></dd>
+        <dt>Blockchain</dt><dd id="wallet-chain"></dd>
+        <dt>Native USDC balance</dt><dd id="wallet-balance">—</dd>
+      </dl>
+      <button id="balance">Read Arc balance</button>
+      <button id="sign">Sign local SIWE message</button>
+      <pre id="message" hidden></pre>
+    </section>
+    <section id="managed-preflight" aria-labelledby="managed-heading" hidden>
+      <h2 id="managed-heading">Managed Execution Preflight</h2>
+      <p>Simulate fixed Termul invoice calls and compare gas estimates. This preflight uses read-only Arc RPC and Circle fee estimation.</p>
+      <button id="run-preflight">Run managed execution preflight</button>
+      <div id="preflight-results" aria-live="polite"></div>
+    </section>
+    <section id="invoice-pilot" aria-labelledby="invoice-pilot-heading" hidden>
+      <h2 id="invoice-pilot-heading">Managed Invoice Creation Pilot</h2>
+      <p id="pilot-mode"></p>
+      <p>Verify a fresh local SIWE message before preparing a review. The invoice amount is 0.01 USDC. The transaction attaches zero USDC and caps network fees at 0.01 USDC.</p>
+      <button id="pilot-review">Prepare invoice review</button>
+      <div aria-label="Managed Invoice Payment Pilot">
+        <h3>Managed Invoice Payment Pilot</h3>
+        <label for="pilot-merchant">Merchant address</label><input id="pilot-merchant" autocomplete="off">
+        <label for="pilot-invoice-input">Invoice ID</label><input id="pilot-invoice-input" autocomplete="off">
+        <button id="pilot-review-payment">Prepare payment review</button>
+      </div>
+      <label for="pilot-hash">Existing Arc transaction hash</label><input id="pilot-hash" autocomplete="off">
+      <button id="pilot-recover">Verify existing hash (read-only)</button>
+      <button id="pilot-reconcile">Check attempt status</button>
+      <button id="pilot-provider-status">Check Circle provider history (read-only)</button>
+      <div id="pilot-details" aria-live="polite"></div>
+      <div id="pilot-confirmation" hidden>
+        <label><input id="pilot-confirm" type="checkbox"> I approve this reviewed invoice and its maximum network fee.</label>
+        <button id="pilot-execute">Open Circle confirmation</button>
+      </div>
+    </section>
+    <button id="logout" hidden>Log out or restart</button>
+    <p id="status" role="status">Loading local configuration…</p>
+  </main>
+</body>
+</html>

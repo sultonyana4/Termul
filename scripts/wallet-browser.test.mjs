@@ -37,6 +37,7 @@ const abi = parseAbi([
   'event InvoicePaid(bytes32 indexed invoiceId, address indexed merchant, address indexed payer, uint256 amount)',
   'function getInvoice(address merchant, bytes32 id) view returns ((address merchant, uint256 amount, uint64 expiresAt, uint8 status))',
   'function payInvoice(address merchant, bytes32 id) payable',
+  'function createInvoice(bytes32 id, uint256 amount, uint64 expiresAt)',
 ]);
 const artifact = JSON.parse(await readFile(new URL('../contracts/out/TermulInvoices.sol/TermulInvoices.json', import.meta.url), 'utf8'));
 const code = artifact.deployedBytecode.object;
@@ -52,8 +53,10 @@ const created = makeLog('InvoiceCreated', creationHash, { invoiceId, merchant },
 const paid = makeLog('InvoicePaid', paymentHash, { invoiceId, merchant, payer }, [['uint256', amount]]);
 const payment = {
   from: payer, to: contract, input: encodeFunctionData({ abi, functionName: 'payInvoice', args: [merchant, invoiceId] }),
-  value: numberToHex(amount), chainId: '0x13b2', type: '0x2', hash: paymentHash, blockNumber: block,
+  value: numberToHex(amount), chainId: '0x13b2', type: '0x2', hash: paymentHash, blockNumber: block, blockHash: paid.blockHash,
 };
+const creation = { ...payment, from: merchant, value: '0x0', hash: creationHash,
+  input: encodeFunctionData({ abi, functionName: 'createInvoice', args: [invoiceId, amount, 0n] }) };
 const actions = [];
 const widths = [320, 375, 400, 768, 1024, 1440];
 let nativeBalance = 5n * 10n ** 18n;
@@ -170,7 +173,7 @@ try {
         eth_gasPrice: () => numberToHex(20_000_000_000n),
         eth_blockNumber: () => block,
         eth_getTransactionCount: () => '0x7',
-        eth_getBlockByNumber: () => ({ number: block, timestamp: '0x69000000', transactions: [] }),
+        eth_getBlockByNumber: () => ({ number: block, hash: paid.blockHash, timestamp: '0x69000000', transactions: [] }),
         eth_call: ([{ to, data }]) => {
           if (Object.values(SWAP_TOKENS).some(token => token.address.toLowerCase() === to.toLowerCase())) {
             const functionName = data.startsWith('0xdd62ed3e') ? 'allowance' : 'balanceOf';
@@ -182,14 +185,14 @@ try {
           && topics.slice(1).every((topic, index) => !topic || topic === log.topics[index + 1])),
         eth_getTransactionByHash: ([hash]) => hash === exchangeHash ? { ...payment, from: merchant, to: exchangeRouter,
           input: exchangeInput, value: '0x0', hash } : hash === swapHash
-          ? { ...payment, from: merchant, to: SWAP_ROUTER, input: swapInput, value: '0x0', hash: swapHash } : payment,
+          ? { ...payment, from: merchant, to: SWAP_ROUTER, input: swapInput, value: '0x0', hash: swapHash } : hash === creationHash ? creation : payment,
         eth_getTransactionReceipt: ([hash]) => hash === exchangeHash ? { status: '0x1', blockNumber: block, transactionHash: hash, logs: [{
           ...paid, address: fromCoin.address, transactionHash: exchangeHash,
           topics: encodeEventTopics({ abi: erc20Abi, eventName: 'Transfer', args: { from: merchant, to: exchangeRouter } }),
           data: encodeAbiParameters([{ type: 'uint256' }], [1_000_000n]),
         }] } : hash === swapHash
           ? { status: '0x1', blockNumber: block, transactionHash: swapHash, logs: swapLog }
-          : { status: '0x1', blockNumber: block, transactionHash: paymentHash, logs: [paid] },
+          : { status: '0x1', blockNumber: block, blockHash: paid.blockHash, transactionHash: hash, logs: [hash === creationHash ? created : paid] },
       };
       const rpcResult = item => {
         if (!Object.hasOwn(methods, item.method)) {
@@ -241,6 +244,7 @@ try {
   await context.addInitScript(({ merchant, secondary, signature }) => {
     window.fixtureCalls = [];
     const makeProvider = (name, address, chain) => {
+      chain = localStorage.getItem('fixture-chain-' + name) || chain;
       let enabled = localStorage.getItem('fixture-permission-' + name) === 'yes';
       const listeners = new Map();
       const emit = (event, data) => listeners.get(event)?.forEach(listener => listener(data));
@@ -263,6 +267,7 @@ try {
           if (method === 'wallet_switchEthereumChain') {
             if (params[0].chainId !== '0x13b2') throw new Error('Unexpected chain');
             chain = params[0].chainId;
+            localStorage.setItem('fixture-chain-' + name, chain);
             emit('chainChanged', chain);
             return null;
           }
@@ -400,12 +405,10 @@ try {
 
   await page.reload();
   await connected(merchant);
-  await authenticated(false);
-  assert.equal(await page.evaluate(() => window.fixtureCalls.some(call => call.method === 'eth_requestAccounts')), false);
-  await openAccount();
-  await switchNetwork();
-  await verify();
   await authenticated(true);
+  assert.equal(await page.evaluate(() => window.fixtureCalls.some(call => call.method === 'eth_requestAccounts')), false);
+  assert.equal(await page.evaluate(() => window.fixtureCalls.some(call => call.method === 'personal_sign')), false);
+  await openAccount();
   await page.evaluate(address => window.fixtureRabby.changeAccount(address), secondary);
   await connected(secondary);
   await authenticated(false);

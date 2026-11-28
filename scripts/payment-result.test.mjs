@@ -6,6 +6,7 @@ import {
   parseUnits,
 } from 'viem';
 import {
+  averagePaymentTime,
   createPaymentSubmissionGate,
   getPaymentDisplayState,
   matchesPaymentTransaction,
@@ -21,6 +22,8 @@ const payer = '0x1111111111111111111111111111111111111111';
 const invoiceId = `0x${'ab'.repeat(32)}`;
 const amount = parseUnits('0.10', 18);
 const hash = `0x${'12'.repeat(32)}`;
+const blockNumber = 33_000_001n;
+const blockHash = '0x' + '08'.repeat(32);
 const abi = [
   {
     type: 'function',
@@ -44,7 +47,7 @@ const abi = [
 const expected = { chainId, contract, merchant, invoiceId, payer, amount, abi, status: { open: 1, paid: 2 } };
 const calldata = encodeFunctionData({ abi, functionName: 'payInvoice', args: [merchant, invoiceId] });
 const transaction = {
-  hash,
+  hash, blockNumber, blockHash,
   from: payer,
   to: contract,
   input: calldata,
@@ -62,12 +65,18 @@ const paidLog = {
 };
 const successfulReceipt = {
   transactionHash: hash,
-  status: 'success',
+  status: 'success', blockNumber, blockHash,
   logs: [{ address: contract, topics: eventTopics, data: eventData }],
 };
-const revertedReceipt = { transactionHash: hash, status: 'reverted', logs: [] };
+const revertedReceipt = { transactionHash: hash, status: 'reverted', blockNumber, blockHash, logs: [] };
 const onchainInvoice = (status) => ({ merchant, amount, expiresAt: 0n, status });
+const canonical = {
+  readFinalizedBlock: async () => ({ number: blockNumber }),
+  readBlock: async () => ({ number: blockNumber, hash: blockHash, timestamp: 1795716212n }),
+  readInvoiceAt: async () => onchainInvoice(2),
+};
 const commonDeps = {
+  ...canonical,
   readChainId: async () => chainId,
   readInvoice: async () => onchainInvoice(2),
   readReceipt: async () => successfulReceipt,
@@ -92,7 +101,7 @@ const commonDeps = {
     },
     waitForReceipt: async () => { throw new Error('Must not wait without a hash.'); },
     reconcile: ({ transactionHash, error }) => reconcilePaymentAttempt({
-      expected,
+    ...canonical,      expected,
       transactionHash,
       error,
       ...commonDeps,
@@ -108,6 +117,7 @@ const commonDeps = {
   let invoiceReads = 0;
   let eventReads = 0;
   const delayedPaidDeps = {
+    ...canonical,
     readChainId: async () => chainId,
     readInvoice: async () => onchainInvoice(++invoiceReads >= 5 ? 2 : 1),
     readReceipt: async () => successfulReceipt,
@@ -126,7 +136,7 @@ const commonDeps = {
     },
     waitForReceipt: async () => { throw new Error('Must not wait without a transaction hash.'); },
     reconcile: ({ transactionHash, error }) => reconcilePaymentAttempt({
-      expected,
+    ...canonical,      expected,
       transactionHash,
       error,
       ...delayedPaidDeps,
@@ -175,6 +185,7 @@ const commonDeps = {
     },
   };
   const delayedRpcDeps = {
+    ...canonical,
     readChainId: async () => chainId,
     readInvoice: async () => onchainInvoice(++invoiceReads >= 5 ? 2 : 1),
     readReceipt: async () => {
@@ -190,7 +201,7 @@ const commonDeps = {
     submit: () => mockWallet.writeContract({ functionName: 'payInvoice' }),
     waitForReceipt: async () => { throw new Error('No wallet hash was returned, so receipt waiting must not run.'); },
     reconcile: ({ transactionHash, receiptHint, error }) => reconcilePaymentAttempt({
-      expected,
+    ...canonical,      expected,
       transactionHash,
       receiptHint,
       error,
@@ -283,7 +294,7 @@ const commonDeps = {
 
 {
   const result = await reconcilePaymentAttempt({
-    expected,
+    ...canonical,    expected,
     transactionHash: hash,
     readChainId: async () => chainId,
     readInvoice: async () => onchainInvoice(1),
@@ -305,7 +316,7 @@ const commonDeps = {
     },
     waitForReceipt: async () => { throw new Error('Timed out waiting for transaction receipt.'); },
     reconcile: ({ transactionHash, error }) => reconcilePaymentAttempt({
-      expected,
+    ...canonical,      expected,
       transactionHash,
       error,
       readChainId: async () => chainId,
@@ -324,7 +335,7 @@ const commonDeps = {
 {
   let scannedEvents = false;
   const result = await reconcilePaymentAttempt({
-    expected,
+    ...canonical,    expected,
     transactionHash: hash,
     error: new Error('Timed out waiting for receipt.'),
     readChainId: async () => chainId,
@@ -342,7 +353,7 @@ const commonDeps = {
 {
   const mismatchedTransaction = { ...transaction, from: '0x2222222222222222222222222222222222222222' };
   const result = await reconcilePaymentAttempt({
-    expected,
+    ...canonical,    expected,
     transactionHash: hash,
     readChainId: async () => chainId,
     readInvoice: async () => onchainInvoice(1),
@@ -373,7 +384,7 @@ const commonDeps = {
 
 {
   const result = await reconcilePaymentAttempt({
-    expected,
+    ...canonical,    expected,
     transactionHash: hash,
     ...commonDeps,
     readInvoice: async () => onchainInvoice(1),
@@ -387,7 +398,7 @@ for (const log of [
   { ...paidLog, transactionHash: '0x' + 'ad'.repeat(32) },
 ]) {
   const result = await reconcilePaymentAttempt({
-    expected,
+    ...canonical,    expected,
     transactionHash: hash,
     ...commonDeps,
     readInvoice: async () => onchainInvoice(1),
@@ -399,13 +410,37 @@ for (const log of [
 {
   let reads = 0;
   const result = await reconcilePaymentAttempt({
-    expected,
+    ...canonical,    expected,
     transactionHash: hash,
     ...commonDeps,
     findPaymentLogs: async () => [],
     readInvoice: async () => onchainInvoice(++reads === 1 ? 1 : 3),
   });
-  assert.equal(result.status, 'inconsistent');
+  assert.equal(result.contractStatePending, true, 'The finalized receipt and block-pinned Paid state survive a lagging latest read.');
 }
 
+{
+  const invoice = { merchant, invoiceId, status: 'paid', onchainVerified: true, createTxHash: hash, paymentTxHash: hash,
+    createdBlockTime: '2026-11-26T18:02:31.000Z', paidBlockTime: '2026-11-26T18:03:32.000Z' };
+  const sameBlock = { ...invoice, invoiceId: '0x' + '36'.repeat(32), paidBlockTime: invoice.createdBlockTime };
+  const missing = { ...invoice, invoiceId: '0x' + '42'.repeat(32), paidBlockTime: undefined };
+  assert.deepEqual(averagePaymentTime([invoice, invoice, sameBlock, missing, { ...missing, status: 'cancelled' }]), { seconds: 30.5, samples: 2, eligible: 3 });
+  assert.deepEqual(averagePaymentTime([missing]), { seconds: null, samples: 0, eligible: 1 });
+  assert.equal(averagePaymentTime([sameBlock]).seconds, 0);
+}
+{
+  const proof = await reconcilePaymentAttempt({ expected, transactionHash: hash, ...commonDeps,
+    findPaymentLogs: async () => { throw Error('index should not be needed'); } });
+  assert.equal(proof.paymentTxHash, hash);
+  assert.equal(proof.payerMatchesExpected, true);
+  const unfinalized = await reconcilePaymentAttempt({ expected, transactionHash: hash, ...commonDeps, readFinalizedBlock: async () => ({ number: blockNumber - 1n }) });
+  assert.equal(unfinalized.proofUnavailable, true);
+  const wrongBlock = await reconcilePaymentAttempt({ expected, transactionHash: hash, ...commonDeps,
+    readBlock: async () => ({ number: blockNumber, hash: 'wrong' }) });
+  assert.equal(wrongBlock.proofUnavailable, true);
+  const otherPayer = await reconcilePaymentAttempt({ expected: { ...expected, payer: '0x' + '35'.repeat(20) }, ...commonDeps,
+    findPaymentLogs: async () => [{ transactionHash: hash }] });
+  assert.equal(otherPayer.status, 'paid');
+  assert.equal(otherPayer.payerMatchesExpected, false);
+}
 console.log('Payment-result regression tests passed (mocked wallet/RPC only; no real wallet, RPC, or transaction submission).');

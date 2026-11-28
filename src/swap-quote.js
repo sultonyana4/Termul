@@ -11,6 +11,19 @@ export const SWAP_TOKENS = Object.freeze({
   USDC: Object.freeze({ symbol: 'USDC', address: '0x3600000000000000000000000000000000000000', decimals: 6 }),
   EURC: Object.freeze({ symbol: 'EURC', address: '0xbEf5f6d51CB62b58e6A8f77868681825C6fe21c1', decimals: 6 }),
 });
+export const ARC_ANY_SWAP_TOKENS = Object.freeze({
+  ...SWAP_TOKENS,
+  cirBTC: Object.freeze({ symbol: 'cirBTC', address: '0x171A4217b86A807A64eB94757Db6849fb4bDbAA0', decimals: 8,
+    runtimeHash: '0xd220f3a1c8035c30fe605588779e611d52d107011ce6a401a98d4025de2ef33e' }),
+  WETH: Object.freeze({ symbol: 'WETH', address: '0x128cC466B61f542da60c70e3aA11c10e19B84EDB', decimals: 18,
+    runtimeHash: '0x0d8d75955ab8fc42763623b4c903e9134bd22563eff209a9ccb1f2607f26aabc' }),
+  VIRTUAL: Object.freeze({ symbol: 'VIRTUAL', address: '0x8C4252c87081c88c6Ad57d6dD97E1cAFebF842B7', decimals: 18,
+    runtimeHash: '0xbfd91bb06292887f4a2645e297247489766704aac3634d65ecafcd9cfa78499e' }),
+  wARS: Object.freeze({ symbol: 'wARS', address: '0x0DC4F92879B7670e5f4e4e6e3c801D229129D90D', decimals: 18,
+    runtimeHash: '0xf8d9ff5ea93bc29b43da9f8727fdeb3c9adac7ec55da259371f7af7182faf6a2' }),
+  CRCL: Object.freeze({ symbol: 'CRCL', address: '0x2ba0f44BDfC17FbA30edA9cdBeCB908cA45B043B', decimals: 18,
+    runtimeHash: '0x33c2d3ade0e0f171791108b83bddb78d0b54710b2e0b1f730074bdc362d57296' }),
+});
 export const SWAP_ROUTER = '0xA4072583658Fae592A3506A42431cb6316a8d40b';
 export const SWAP_FACET = '0x0E60f12E2CE6b4EA51bde7A2aD61A22B12605c9C';
 export const FLY_ROUTER = '0x20F6ee51340aDEed01A59B0e65cB3703f3dc860c';
@@ -36,15 +49,16 @@ export function unsigned(value) {
   return BigInt(value);
 }
 
-export function parseSwapAmount(text) {
+export function parseSwapAmount(text, decimals = 6) {
   const value = text.trim();
-  if (!/^\d{1,72}(?:\.\d{1,6})?$/.test(value)) return null;
-  const amount = parseUnits(value, 6);
+  const fraction = decimals ? `(?:\\.\\d{1,${decimals}})?` : '';
+  if (!new RegExp(`^\\d{1,72}${fraction}$`).test(value)) return null;
+  const amount = parseUnits(value, decimals);
   return amount > 0n && amount <= MAX_UINT ? amount : null;
 }
 
-export function swapRate(input, output) {
-  return formatUnits(output * 100_000_000n / input, 8);
+export function swapRate(input, output, fromDecimals = 6, toDecimals = 6) {
+  return formatUnits(output * 10n ** BigInt(fromDecimals + 8) / (input * 10n ** BigInt(toDecimals)), 8);
 }
 
 function requireRoute(condition) {
@@ -67,9 +81,23 @@ function validateFly(step, from, to, amount, requiresDeposit) {
     && unsigned(slice(packed, 64, 96)) === amount);
 }
 
-export function parseSwapQuote(raw, { from, to, amount, account }, requestedAt, policy = swapFee) {
+// Use input after the separately disclosed fees when comparing equal USD units.
+function estimateReferenceImpact(action, netAmount, received) {
+  const readPrice = value => typeof value === 'string' && /^\d{1,8}(?:\.\d{1,18})?$/.test(value)
+    ? parseUnits(value, 18) : 0n;
+  const inputValue = netAmount * readPrice(action.fromToken.priceUSD) * 10n ** BigInt(action.toToken.decimals);
+  const outputValue = received * readPrice(action.toToken.priceUSD) * 10n ** BigInt(action.fromToken.decimals);
+  if (inputValue <= 0n || outputValue <= 0n) return null;
+  const percentage = (inputValue - outputValue) * 1_000_000n / inputValue;
+  return percentage >= -100_000_000n ? formatUnits(percentage, 4) : null;
+}
+
+export function parseSwapQuote(raw, { from, to, amount, account, anyToken = false, verifiedAssets }, requestedAt, policy = swapFee) {
   const { action, estimate, transactionRequest: request } = raw;
-  requireRoute(SWAP_TOKENS[from?.symbol] === from && SWAP_TOKENS[to?.symbol] === to && from !== to &&
+  const tokens = anyToken ? ARC_ANY_SWAP_TOKENS : SWAP_TOKENS;
+  const recognized = anyToken && verifiedAssets ? verifiedAssets[0] === from && verifiedAssets[1] === to
+    : tokens[from?.symbol] === from && tokens[to?.symbol] === to;
+  requireRoute(from && to && recognized && !equalAddress(from.address, to.address) &&
     raw.type === 'lifi' && raw.tool === 'fly' && raw.integrator === TERMUL_INTEGRATOR && matchesFeeRate(raw.fee, policy) && noExtraDistributions(raw)
     && action?.fromChainId === arcNetwork.id && action.toChainId === arcNetwork.id && action.slippage === SLIPPAGE
     && tokenMatches(action.fromToken, from) && tokenMatches(action.toToken, to)
@@ -84,7 +112,9 @@ export function parseSwapQuote(raw, { from, to, amount, account }, requestedAt, 
     && gasLimit > 0n && gasLimit <= MAX_SWAP_GAS_LIMIT);
 
   const fees = estimate.feeCosts ?? [];
-  requireRoute(Array.isArray(fees) && fees.length <= 1 && (!policy.bps || fees.length === 1));
+  // LI.FI omits the fee step when neither fee can be represented in a base unit.
+  const feeCanRoundToZero = anyToken && Array.isArray(estimate.feeCosts) && amount > 0n && amount * BigInt(policy.bps) < 10_000n;
+  requireRoute(Array.isArray(fees) && fees.length <= 1 && (!policy.bps || fees.length === 1 || feeCanRoundToZero));
   const fee = fees.length ? readFeeSplit(fees[0], action.fromToken, amount, policy) : null;
 
   const { functionName, args: [id, integrator, referrer, receiver, min, data] } = decodeExact(SWAP_ABI, request.data);
@@ -110,6 +140,7 @@ export function parseSwapQuote(raw, { from, to, amount, account }, requestedAt, 
   return Object.freeze({
     account: getAddress(account), from, to, amount, received, minimum, feePolicy: policy, providerFee: fee?.providerFee ?? 0n, integratorFee: fee?.integratorFee ?? 0n, integrator, id,
     networkFee: gasCosts.length ? networkFee : null, priceImpact,
+    referencePriceImpact: priceImpact === null ? estimateReferenceImpact(action, amount - (fee?.total ?? 0n), received) : null,
     route: 'LI.FI · Fly', gasLimit, expiresAt: requestedAt + QUOTE_TTL, data: request.data,
   });
 }

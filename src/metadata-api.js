@@ -2,6 +2,7 @@ import { arcNetwork } from './arc-network.js';
 import { endpointFor } from './wallet-session.js';
 
 const scope = { chainId: arcNetwork.id, contractAddress: arcNetwork.contractAddress };
+const localCircle = typeof import.meta.env !== 'undefined' && import.meta.env.TERMUL_LOCAL_CIRCLE;
 const pendingWrites = new Map();
 function request(action, payload, expectedAddress) {
   const session = window.termulWallet?.session;
@@ -12,6 +13,17 @@ function request(action, payload, expectedAddress) {
 // Only public display metadata travels on this unauthenticated path.
 // The service returns neither client email nor merchant profile details.
 async function publicInvoice(merchantAddress, invoiceId) {
+  if (import.meta.env.TERMUL_LOCAL_CIRCLE) {
+    try {
+      const response = await fetch('/__termul_circle/api', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, cache: 'no-store',
+        body: JSON.stringify({ ...scope, action: 'local-public-invoice', merchantAddress, invoiceId }),
+        signal: AbortSignal.timeout(8_000),
+      });
+      if (response.ok) return (await response.json()).invoice;
+    } catch { /* Public display metadata is optional. */ }
+    return null;
+  }
   const endpoint = endpointFor(import.meta.env.VITE_TERMUL_WALLET_API_URL);
   if (!endpoint || typeof window === 'undefined' || window.location.origin !== arcNetwork.origin) return null;
   try {
@@ -54,8 +66,8 @@ export const metadataApi = Object.freeze({
   savePaymentAttempt: (merchantAddress, invoiceId, attemptId, transactionHash) => writeAttempt(
     'save_payment_attempt', merchantAddress, invoiceId, { attemptId, transactionHash },
   ),
-  clearPaymentAttempt: (merchantAddress, invoiceId, attemptId) => writeAttempt(
-    'clear_payment_attempt', merchantAddress, invoiceId, { attemptId },
+  clearPaymentAttempt: (merchantAddress, invoiceId, attemptId, proof) => writeAttempt(
+    'clear_payment_attempt', merchantAddress, invoiceId, { attemptId, ...(localCircle && proof) },
   ),
 });
 

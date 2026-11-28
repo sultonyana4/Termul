@@ -8,6 +8,16 @@
 .swap-token-row > label, .swap-token-row > span { font-weight: 700; }
 .swap-amount-row, .swap-balance { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-width: 0; }
 .swap-amount-row { margin-top: 8px; }
+[data-swap$="-fixed"][hidden], .circle-token-choice[hidden] { display: none; }
+.circle-token-choice { display: inline-flex; align-items: center; gap: 6px; min-height: 44px; max-width: 52%; overflow: hidden; }
+.circle-token-choice .token-icon { flex: none; }
+#circle-arc-token-picker { width: min(540px, calc(100% - 24px)); max-height: calc(100dvh - 28px); overflow: auto; }
+.circle-token-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
+.circle-token-row { width: 100%; display: grid; grid-template-columns: 32px minmax(0, 1fr) minmax(38px, auto); gap: 8px; align-items: center; min-height: 52px; text-align: start; }
+.circle-token-row small { display: block; color: var(--muted); overflow-wrap: anywhere; }
+.circle-token-balance { max-width: 95px; overflow-wrap: anywhere; text-align: right; }
+.token-fallback { display: inline-block; border-radius: 50%; background: var(--panel3); border: 1px solid var(--line); }
+[data-swap$="-icon"]:not([src]) { display: none; }
 .swap-amount-row input, .swap-amount-row output { flex: 1; min-width: 0; font-size: clamp(24px, 4vw, 34px); font-weight: 700; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; letter-spacing: -.04em; }
 .swap-amount-row input.field { padding: 0 2px; height: 48px; border: 0; background: transparent; }
 .swap-amount-row input.field:focus-visible { outline: 2px solid var(--cyan); outline-offset: 3px; }

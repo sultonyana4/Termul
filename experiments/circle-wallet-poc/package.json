@@ -1,0 +1,32 @@
+{
+  "name": "termul-circle-wallet-poc",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "build": "node build.js",
+    "start": "npm run build && node --env-file-if-exists=.env server.js",
+    "test": "node --test",
+    "check:arc": "node rpc-check.js"
+  },
+  "dependencies": {
+    "@circle-fin/user-controlled-wallets": "10.8.1",
+    "@circle-fin/w3s-pw-web-sdk": "1.1.11",
+    "viem": "2.58.6"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2",
+    "esbuild-plugins-node-modules-polyfill": "1.8.3",
+    "stream-browserify": "3.0.0"
+  },
+  "overrides": {
+    "undici": "6.29.1",
+    "@grpc/grpc-js": "1.14.7",
+    "@circle-fin/w3s-pw-web-sdk": {
+      "uuid": "11.1.1"
+    }
+  }
+}
