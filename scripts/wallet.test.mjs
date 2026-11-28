@@ -90,6 +90,11 @@ const provider = { request: async ({ method, params }) => {
   assert.fail(method);
 } };
 const requests = [];
+const tab = new Map();
+Object.defineProperty(globalThis, 'sessionStorage', { configurable: true, value: {
+  getItem: key => tab.get(key), setItem: (key, value) => tab.set(key, value), removeItem: key => tab.delete(key),
+} });
+let rejectRestore = false;
 let tryChangeAccount = false;
 let rejectSignature = false;
 let badDomain = false;
@@ -112,7 +117,7 @@ const fakeFetch = async (address, options) => {
     if (verifyResponseStarted) { verifyResponseStarted(); await new Promise(resolve => { releaseVerify = resolve; }); }
     return Response.json({ sessionToken: 'bb'.repeat(32), walletAddress: a, expiresAt: new Date(Date.now() + 60_000).toISOString() });
   }
-  return Response.json({ ok: true });
+  return Response.json({ ok: true }, { status: rejectRestore && payload.action === 'get_profile' ? 401 : 200 });
 };
 const session = createWalletSession({ getWallet: () => selected, url: endpointFor(url), origin,
   getProvider: async () => ({ request: async (input) => {
@@ -157,6 +162,23 @@ assert.equal(session.isAuthenticated(), true);
 await session.request('get_profile', {}, a);
 assert.equal(requests.at(-1).headers.Authorization, 'Bearer ' + 'bb'.repeat(32));
 await assert.rejects(session.request('get_profile', {}, b), /Verify ownership/);
+const restore = () => createWalletSession({ getWallet: () => selected, url, origin, getProvider: async () => provider, fetchRequest: fakeFetch });
+const restored = restore();
+await restored.restore();
+assert.equal(restored.isAuthenticated(), true);
+assert.equal(requests.filter(x => x.payload.action === 'verify').length, 1);
+rejectRestore = true;
+const rejected = restore();
+await rejected.restore();
+assert.equal(rejected.isAuthenticated(), false);
+assert.equal(tab.size, 0);
+rejectRestore = false;
+const key = 'termul.siwe.v1.external';
+tab.set(key, JSON.stringify({ url, address: a, connector: 'rabby', token: 'bb'.repeat(32), expires: Date.now() - 1, verifiedAt: Date.now() - 60_000 }));
+const beforeExpiry = requests.length;
+await restore().restore();
+assert.equal(requests.length, beforeExpiry);
+restored.invalidate();
 selected = { ...selected, chainId: 1 };
 assert.equal(session.isAuthenticated(), false);
 session.invalidate();

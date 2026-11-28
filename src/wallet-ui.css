@@ -27,3 +27,46 @@
 .wallet-choice small { display: block; color: var(--muted); }
 #wallet-connect-status, #wallet-none { color: var(--muted); margin: 12px 0 0; }
 #wallet-connect-status:empty { display: none; }
+
+#circle-email-form { display: grid; gap: 10px; margin-bottom: 12px; }
+#circle-email-form input { width: 100%; min-width: 0; }
+#circle-review-details { white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; line-height: 1.6; }
+#circle-login-dialog button:not([hidden]) + button:not([hidden]) { margin-inline-start: 8px; }
+
+#circle-review-dialog, #circle-arc-token-picker {
+  color-scheme: dark;
+  color: var(--text);
+  background: var(--panel);
+  border: 1px solid #334056;
+  border-radius: 20px;
+  box-shadow: var(--shadow);
+  font: inherit;
+  width: min(540px, calc(100% - 24px));
+  max-height: calc(100dvh - 28px);
+  padding: clamp(14px, 4vw, 24px);
+  overflow: auto;
+}
+#circle-review-dialog::backdrop, #circle-arc-token-picker::backdrop { background: rgb(8 11 19 / 78%); }
+#circle-review-title, #circle-arc-token-title { color: var(--text); margin: 0; font: 700 1.25rem var(--display); }
+.circle-token-picker-header { position: sticky; top: -1px; z-index: 1; background: var(--panel); padding: 8px 0; }
+.circle-token-picker-header .account-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.circle-token-picker-header input { width: 100%; margin-top: 6px; }
+.circle-token-picker-header .hint, #circle-swap-review-terms > p { color: #b5bfd1; }
+#circle-review-dialog .wallet-dialog-heading { justify-content: end; margin: 16px 0 0; flex-wrap: wrap; }
+#circle-swap-review-terms:not([hidden]) { display: grid; gap: 12px; }
+#circle-swap-review-terms > p { margin: 10px 0 0; }
+#circle-swap-review-terms section { padding: 12px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel2); }
+#circle-swap-review-terms h3 { margin: 0 0 8px; font-size: .95rem; }
+#circle-swap-review-terms dl { margin: 0; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 7px 12px; }
+#circle-swap-review-terms dt { color: #b5bfd1; }
+#circle-swap-review-terms dd { margin: 0; text-align: end; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+#circle-swap-review-terms summary { color: var(--cyan); cursor: pointer; min-height: 44px; align-content: center; }
+.token-artwork { position: relative; display: inline-grid; place-items: center; width: 32px; height: 32px; flex: none; }
+.token-artwork .token-initials { display: none; }
+.token-artwork .token-fallback { visibility: hidden; }
+.token-artwork .token-fallback + .token-initials {
+  display: grid; place-items: center; position: absolute; inset: 0; border-radius: 50%;
+  border: 1px solid #53647e; background: var(--panel3); color: var(--text); font-size: .72rem; font-weight: 700;
+}
+.circle-swap-progress { margin: 0 0 12px; padding: 10px 10px 10px 28px; border: 1px solid var(--line); border-radius: 12px; color: #b5bfd1; }
+.circle-swap-progress li[aria-current="step"] { color: var(--cyan); font-weight: 700; }

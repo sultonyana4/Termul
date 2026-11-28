@@ -2,6 +2,7 @@
 .swap-tabs button { flex: 1; min-height: 44px; border: 0; border-radius: 10px; background: transparent; color: var(--muted); font-weight: 700; }
 .swap-tabs button[aria-selected="true"] { color: var(--cyan); background: var(--panel3); }
 .any-token-content { max-width: 500px; margin: 0 auto; min-width: 0; }
+.any-token-content.circle-arc-active { max-width: 880px; }
 #exchange-widget { width: 100%; min-width: 0; }
 #exchange-load-status:empty { display: none; }
 #exchange-networks:not([hidden]) {

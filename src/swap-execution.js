@@ -20,15 +20,16 @@ async function requireMainnet(client) {
 
 const tokenRead = (client, token, functionName, args) =>
   client.readContract({ address: token.address, abi: erc20Abi, functionName, args });
+const balanceKey = token => token.chainId === arcNetwork.id ? token.address.toLowerCase() : token.symbol;
+export const swapTokenBalance = (balances, token) => balances?.[balanceKey(token)];
 
-export async function readSwapBalances(client, address) {
+export async function readSwapBalances(client, address, tokens = Object.values(SWAP_TOKENS)) {
   await requireMainnet(client);
-  const [USDC, EURC, native] = await Promise.all([
-    tokenRead(client, SWAP_TOKENS.USDC, 'balanceOf', [address]),
-    tokenRead(client, SWAP_TOKENS.EURC, 'balanceOf', [address]),
+  const [native, ...amounts] = await Promise.all([
     client.getBalance({ address }),
+    ...tokens.map(token => tokenRead(client, token, 'balanceOf', [address])),
   ]);
-  return { USDC, EURC, native };
+  return { ...Object.fromEntries(tokens.map((token, index) => [balanceKey(token), amounts[index]])), native };
 }
 
 async function gasPrice(client) {
@@ -39,27 +40,28 @@ async function gasPrice(client) {
 const withGasHeadroom = value => (value * 12n + 9n) / 10n;
 
 export function spendableAmount(balances, token, reserve) {
-  if (token !== SWAP_TOKENS.USDC) return balances[token.symbol];
+  const balance = swapTokenBalance(balances, token);
+  if (!equalAddress(token.address, SWAP_TOKENS.USDC.address)) return balance;
   const remaining = balances.native > reserve ? (balances.native - reserve) / tokenPrecisionRatio : 0n;
-  return remaining < balances.USDC ? remaining : balances.USDC;
+  return remaining < balance ? remaining : balance;
 }
 
 export async function maxSwapAmount(client, address, token) {
-  const [balances, price] = await Promise.all([readSwapBalances(client, address), gasPrice(client)]);
+  const [balances, price] = await Promise.all([readSwapBalances(client, address, [token]), gasPrice(client)]);
   return spendableAmount(balances, token, withGasHeadroom(price) * (MAX_SWAP_GAS_LIMIT + APPROVAL_GAS_LIMIT));
 }
 
 function requireBalance(quote, balances, gasBudget) {
-  if (balances[quote.from.symbol] < quote.amount) throw new Error(`Insufficient ${quote.from.symbol} balance.`);
+  if (swapTokenBalance(balances, quote.from) < quote.amount) throw new Error(`Insufficient ${quote.from.symbol} balance.`);
   if (spendableAmount(balances, quote.from, gasBudget) < quote.amount || balances.native < gasBudget) {
     throw new Error('Keep enough native USDC to pay the network fee.');
   }
 }
 
-export async function reviewSwap(client, quote) {
+export async function reviewSwap(client, quote, balanceTokens) {
   assertFreshQuote(quote);
   const [balances, allowance, price] = await Promise.all([
-    readSwapBalances(client, quote.account), tokenRead(client, quote.from, 'allowance', [quote.account, SWAP_ROUTER]), gasPrice(client),
+    readSwapBalances(client, quote.account, balanceTokens), tokenRead(client, quote.from, 'allowance', [quote.account, SWAP_ROUTER]), gasPrice(client),
   ]);
   const needsApproval = allowance < quote.amount;
   const priceLimit = withGasHeadroom(price);
@@ -69,22 +71,30 @@ export async function reviewSwap(client, quote) {
   return { needsApproval, gasBudget, gasPrice: priceLimit, feePolicy: quote.feePolicy };
 }
 
-async function verifyRouteDeployment(client, data) {
-  const [facet, flyCode, feeCode, usdcDecimals, eurcDecimals] = await Promise.all([
+export async function verifyRouteDeployment(client, data, tokens = Object.values(SWAP_TOKENS)) {
+  const [facet, flyCode, feeCode, ...tokenChecks] = await Promise.all([
     client.readContract({ address: SWAP_ROUTER, abi: loupeAbi, functionName: 'facetAddress', args: [data.slice(0, 10)] }),
     client.getCode({ address: FLY_ROUTER }),
     client.getCode({ address: FEE_FORWARDER }),
-    tokenRead(client, SWAP_TOKENS.USDC, 'decimals', []),
-    tokenRead(client, SWAP_TOKENS.EURC, 'decimals', []),
+    ...tokens.map(async token => {
+      const [decimals, code, symbol, name] = await Promise.all([
+        tokenRead(client, token, 'decimals', []), token.runtimeHash && client.getCode({ address: token.address }),
+        token.contractSymbol && tokenRead(client, token, 'symbol', []), token.contractName && tokenRead(client, token, 'name', []),
+      ]);
+      return decimals === token.decimals && (!token.runtimeHash || Boolean(code && keccak256(code) === token.runtimeHash))
+        && symbol === token.contractSymbol && name === token.contractName;
+    }),
   ]);
   if (!equalAddress(facet, SWAP_FACET) || !flyCode || keccak256(flyCode) !== '0xaffe8098fa7a152f718c07de0ea7657382e535a301aaf12f89bbba8f91e4b352'
     || !feeCode || keccak256(feeCode) !== '0x99a76627aece8903612e0246c10f13a46e511a0a074d9a4e68987a28c78ebd52'
-    || usdcDecimals !== 6 || eurcDecimals !== 6) throw new Error('The reviewed Arc swap deployment could not be verified.');
+    || tokenChecks.includes(false)) throw new Error('The reviewed Arc swap deployment could not be verified.');
 }
 
-function validateRecord(record, account) {
-  if (!equalAddress(record?.account, account) || !Object.hasOwn(SWAP_TOKENS, record.from)
-    || !Object.hasOwn(SWAP_TOKENS, record.to) || record.from === record.to
+function validateRecord(record, account, tokens = SWAP_TOKENS, assets) {
+  const from = assets ? assets[0] : Object.hasOwn(tokens, record?.from) && tokens[record.from];
+  const to = assets ? assets[1] : Object.hasOwn(tokens, record?.to) && tokens[record.to];
+  if (!equalAddress(record?.account, account) || !from || !to || from.symbol !== record.from || to.symbol !== record.to
+    || !equalAddress(from.address, from.address) || !equalAddress(to.address, to.address) || equalAddress(from.address, to.address)
     || !['approval', 'swap'].includes(record.phase) || !isHash(record.dataHash) || !isHash(record.id)
     || (record.hash !== null && !isHash(record.hash)) || (record.approvalHash && !isHash(record.approvalHash))
     || (record.integrator !== undefined && record.integrator !== TERMUL_INTEGRATOR)
@@ -105,9 +115,7 @@ export function swapLedger(storage) {
   };
 }
 
-function verifiedTransfers(receipt, record) {
-  const from = SWAP_TOKENS[record.from];
-  const to = SWAP_TOKENS[record.to];
+function verifiedTransfers(receipt, record, from, to) {
   let spent = 0n;
   let received = 0n;
   let completion;
@@ -135,16 +143,17 @@ function verifiedTransfers(receipt, record) {
     && received >= unsigned(record.minimum) && received === completion.toAmount ? { spent, received } : null;
 }
 
-export async function verifySwapRecord(client, record, receiptHint) {
-  validateRecord(record, record.account);
+export async function verifySwapRecord(client, record, receiptHint, transactionHint, tokens = SWAP_TOKENS, assets) {
+  validateRecord(record, record.account, tokens, assets);
+  const [from, to] = assets ?? [tokens[record.from], tokens[record.to]];
   if (!record.hash) return { status: 'pending' };
   try {
     await requireMainnet(client);
     const [receipt, tx] = await Promise.all([
       receiptHint || client.getTransactionReceipt({ hash: record.hash }),
-      client.getTransaction({ hash: record.hash }),
+      transactionHint || client.getTransaction({ hash: record.hash }),
     ]);
-    const target = record.phase === 'approval' ? SWAP_TOKENS[record.from].address : SWAP_ROUTER;
+    const target = record.phase === 'approval' ? from.address : SWAP_ROUTER;
     if (!receipt || !tx || receipt.transactionHash?.toLowerCase() !== record.hash.toLowerCase()
       || tx.hash?.toLowerCase() !== record.hash.toLowerCase()
       || !equalAddress(tx.from, record.account) || !equalAddress(tx.to, target) || tx.value !== 0n
@@ -153,7 +162,7 @@ export async function verifySwapRecord(client, record, receiptHint) {
     if (receipt.status === 'reverted') return { status: 'reverted' };
     if (receipt.status !== 'success') return { status: 'pending' };
     if (record.phase === 'approval') return { status: 'approved' };
-    const amounts = verifiedTransfers(receipt, record);
+    const amounts = verifiedTransfers(receipt, record, from, to);
     return amounts ? { status: 'confirmed', ...amounts } : { status: 'pending' };
   } catch {
     return { status: 'pending' };

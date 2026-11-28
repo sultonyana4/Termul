@@ -125,7 +125,8 @@ export function createTransactionDialog(dialog) {
     update(scope, phase, details) {
       if (active?.scope === scope) active.update(phase, details);
     },
-    clear() {
+    clear(scope) {
+      if (scope !== undefined && active?.scope !== scope) return;
       active = null;
       if (dialog.open) dialog.close();
     },

@@ -42,6 +42,16 @@ const fixtureClient = { getChainId: async () => 5042,
 await verifyInvoiceDeployment(fixtureClient, fixtureNetwork);
 await assert.rejects(verifyInvoiceDeployment({ ...fixtureClient, getCode: async () => fixtureCode }, fixtureNetwork), /deployment block/);
 await assert.rejects(verifyInvoiceDeployment(fixtureClient, arcNetwork), /runtime bytecode/);
+let historicalReads = 0;
+await verifyInvoiceDeployment({ ...fixtureClient, async getCode(args) {
+  if (args.blockNumber === block && ++historicalReads === 1) throw Object.assign(new Error('temporary fixture limit'), { status: 429 });
+  return fixtureClient.getCode(args);
+} }, fixtureNetwork);
+assert.equal(historicalReads, 2);
+await assert.rejects(verifyInvoiceDeployment({ ...fixtureClient, async getCode(args) {
+  if (args.blockNumber === block - 1n) throw new Error('synthetic archive unavailable');
+  return fixtureClient.getCode(args);
+} }, fixtureNetwork), { code: 'ARC_DEPLOYMENT_RPC', message: /pre-deployment bytecode/ });
 
 const html = await readFile(new URL('../index.html', import.meta.url), 'utf8');
 const source = await readFile(new URL('../supabase/functions/_shared/termul-mainnet.js', import.meta.url), 'utf8');
@@ -54,6 +64,7 @@ const abi = parseAbi([
   'event InvoicePaid(bytes32 indexed invoiceId, address indexed merchant, address indexed payer, uint256 amount)',
 ]);
 const data = encodeFunctionData({ abi, functionName: 'payInvoice', args: [merchant, id] });
+const blockHash = '0x' + 'b1'.repeat(32);
 const invoiceResult = status => encodeFunctionResult({ abi, functionName: 'getInvoice', result: { merchant, amount, expiresAt: 0n, status } });
 const paidLog = {
   address, blockNumber: numberToHex(block), transactionHash: hash, logIndex: '0x0', transactionIndex: '0x0', removed: false,
@@ -61,7 +72,7 @@ const paidLog = {
   data: encodeAbiParameters([{ type: 'uint256' }], [amount]),
 };
 const transaction = { from: payer, to: address, input: data, value: numberToHex(amount),
-  chainId: '0x13b2', type: '0x2', hash, blockNumber: numberToHex(block) };
+  chainId: '0x13b2', type: '0x2', hash, blockHash, blockNumber: numberToHex(block) };
 
 async function runFrontend(options, exercise) {
   const { env = {}, params = tagged, rpcChain = 5042, walletAccount = payer, walletChain = 5042,
@@ -162,9 +173,9 @@ async function runFrontend(options, exercise) {
       eth_blockNumber: numberToHex(block),
       eth_getLogs: paid && body.params?.[0]?.topics?.[0] === paidLog.topics[0] ? [paidLog] : [],
       eth_getTransactionByHash: creation?.transaction || (paid ? transaction : null),
-      eth_getTransactionReceipt: creation?.receipt || (paid ? { blockNumber: numberToHex(block), transactionHash: hash, status: '0x1', logs: [paidLog] } : null),
+      eth_getTransactionReceipt: creation?.receipt || (paid ? { blockHash, blockNumber: numberToHex(block), transactionHash: hash, status: '0x1', logs: [paidLog] } : null),
       eth_estimateGas: '0x10000',
-      eth_getBlockByNumber: { baseFeePerGas: '0x4a817c800', transactions: [] },
+      eth_getBlockByNumber: { baseFeePerGas: '0x4a817c800', hash: blockHash, number: numberToHex(block), timestamp: '0x69000000', transactions: [] },
       eth_maxPriorityFeePerGas: '0x0',
       eth_getBalance: numberToHex(balance),
       eth_getTransactionCount: '0x7',

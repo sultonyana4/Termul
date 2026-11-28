@@ -5,6 +5,9 @@
   "type": "module",
   "scripts": {
     "dev": "vite --host 0.0.0.0",
+    "dev:circle": "node scripts/circle-local.mjs",
+    "test:circle:api": "node --test server/circle/*.test.js",
+    "test:circle:browser": "node scripts/circle-browser.test.mjs",
     "build": "vite build",
     "preview": "vite preview --host 0.0.0.0",
     "test:profile": "node scripts/profile-smoke.mjs",
@@ -21,18 +24,45 @@
     "test:fee-policy": "node scripts/fee-policy.test.mjs"
   },
   "dependencies": {
-    "@wagmi/core": "3.6.9",
-    "viem": "2.57.17",
-    "wagmi": "3.7.11",
-    "@tanstack/react-query": "5.104.0",
-    "react": "19.3.1",
-    "react-dom": "19.3.1",
+    "@circle-fin/user-controlled-wallets": "10.8.1",
+    "@circle-fin/w3s-pw-web-sdk": "1.1.11",
+    "@lifi/sdk-provider-ethereum": "4.3.1",
     "@lifi/widget": "4.11.0",
     "@lifi/widget-provider-ethereum": "4.2.0",
-    "@lifi/sdk-provider-ethereum": "4.3.1"
+    "@tanstack/react-query": "5.104.0",
+    "@wagmi/core": "3.6.9",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "viem": "2.57.17",
+    "wagmi": "3.7.11"
   },
   "devDependencies": {
+    "esbuild": "0.28.2",
+    "esbuild-plugins-node-modules-polyfill": "1.8.3",
     "jsdom": "^31.0.0",
+    "playwright": "1.63.0",
+    "stream-browserify": "3.0.0",
     "vite": "^6.4.1"
+  },
+  "overrides": {
+    "@circle-fin/w3s-pw-web-sdk": {
+      "uuid": "11.1.1"
+    },
+    "@firebase/auth-compat": {
+      "undici": "6.29.1"
+    },
+    "@firebase/auth": {
+      "undici": "6.29.1"
+    },
+    "@firebase/firestore": {
+      "undici": "6.29.1",
+      "@grpc/grpc-js": "1.14.7"
+    },
+    "@firebase/functions": {
+      "undici": "6.29.1"
+    },
+    "@firebase/storage": {
+      "undici": "6.29.1"
+    }
   }
 }

@@ -16,14 +16,18 @@ export function endpointFor(value) {
   }
 }
 
-export function createWalletSession({ getWallet, getProvider, url, origin, fetchRequest = fetch, onChange = () => {} }) {
+export function createWalletSession({ getWallet, getProvider, url, origin, fetchRequest = fetch, onChange = () => {}, circleSign, localOrigin }) {
+  const storageKey = 'termul.siwe.v1.' + (circleSign ? 'circle' : 'external');
+  const expectedOrigin = localOrigin ?? arcNetwork.origin;
+  const expectedDomain = new URL(expectedOrigin).host;
   let current = null;
   let inFlight = null;
+  let restoring = null;
   let generation = 0;
   let expiryTimer;
   const send = async (action, body, auth) => {
-    if (arcNetwork.error || !url || origin() !== arcNetwork.origin) {
-      throw new Error('Secure wallet verification requires the configured Termul production origin.');
+    if (arcNetwork.error || !url || origin() !== expectedOrigin || (localOrigin && url !== '/__termul_circle/web3')) {
+      throw new Error('Secure wallet verification requires the configured Termul origin.');
     }
     const result = await fetchRequest(url, {
       method: 'POST', credentials: 'omit', mode: 'cors', redirect: 'error', cache: 'no-store',
@@ -37,19 +41,74 @@ export function createWalletSession({ getWallet, getProvider, url, origin, fetch
   };
 
   const revoke = (session) => void send('logout', { walletAddress: session.wallet.address }, session).catch(() => {});
+  const saved = () => {
+    try {
+      const record = JSON.parse(globalThis.sessionStorage?.getItem(storageKey) ?? 'null');
+      if (record?.url === url && /^[a-f0-9]{64}$/.test(record.token) && /^0x[a-f0-9]{40}$/.test(record.address)
+        && Number.isFinite(record.expires) && Number.isFinite(record.verifiedAt)
+        && record.expires > Date.now() && record.verifiedAt <= Date.now() && record.verifiedAt >= Date.now() - 12 * 60_000) return record;
+    } catch { /* Tab storage may be disabled. */ }
+    return null;
+  };
+  const save = (session) => {
+    try {
+      if (session) globalThis.sessionStorage?.setItem(storageKey, JSON.stringify({ url, token: session.token,
+        address: session.wallet.address.toLowerCase(), connector: session.wallet.connectorScope ?? session.wallet.connectorId,
+        expires: session.expires, verifiedAt: session.verifiedAt }));
+      else globalThis.sessionStorage?.removeItem(storageKey);
+    } catch { /* The live session still works without tab storage. */ }
+  };
   const invalidate = () => {
     generation++;
+    const stored = saved();
     const previous = current;
     current = null;
     inFlight = null;
+    restoring = null;
     clearTimeout(expiryTimer);
+    save(null);
+    if (!previous && stored) revoke({ token: stored.token, wallet: { address: stored.address } });
     if (previous) {
       revoke(previous);
       onChange();
     }
   };
   const snapshot = () => current && sameWallet(current.wallet, getWallet()) && current.expires > Date.now() ? current : null;
+  const activate = (next) => {
+    clearTimeout(expiryTimer);
+    current = next;
+    save(next);
+    expiryTimer = setTimeout(invalidate, Math.min(12 * 60_000, next.expires - Date.now()));
+    onChange();
+  };
+  const restore = async () => {
+    if (snapshot() || inFlight) return;
+    if (restoring) return restoring;
+    const wallet = getWallet();
+    if (!wallet || wallet.chainId !== arcNetwork.id) return;
+    const stored = saved();
+    if (!stored) return;
+    if (stored.address !== wallet.address.toLowerCase() || stored.connector !== (wallet.connectorScope ?? wallet.connectorId)) {
+      invalidate(); return;
+    }
+    const version = generation;
+    const next = { ...stored, wallet };
+    const pending = (async () => {
+      try {
+        const provider = circleSign ? null : await getProvider(wallet);
+        if (provider) await assertWalletProvider(provider, wallet.address);
+        await send('get_profile', { walletAddress: wallet.address }, next);
+        if (provider) await assertWalletProvider(provider, wallet.address);
+        if (version === generation && next.expires > Date.now() && sameWallet(wallet, getWallet())) activate(next);
+      } catch (error) {
+        if (version === generation && [401, 403].includes(error.status)) invalidate();
+      }
+    })();
+    restoring = pending;
+    try { await pending; } finally { if (restoring === pending) restoring = null; }
+  };
   const authenticate = async ({ fresh = false } = {}) => {
+    if (restoring) await restoring;
     const existing = snapshot();
     if (existing && (!fresh || Date.now() - existing.verifiedAt < 5 * 60_000)) return;
     if (inFlight) return inFlight;
@@ -58,23 +117,24 @@ export function createWalletSession({ getWallet, getProvider, url, origin, fetch
     const version = generation;
     const stillSelected = () => version === generation && sameWallet(wallet, getWallet());
     const operation = async () => {
-      const provider = await getProvider(wallet);
-      await assertWalletProvider(provider, wallet.address);
+      const provider = circleSign ? null : await getProvider(wallet);
+      if (!circleSign) await assertWalletProvider(provider, wallet.address);
       const { challengeToken, message } = await send('challenge', { walletAddress: wallet.address });
       if (typeof challengeToken !== 'string' || !/^[a-f0-9]{64}$/.test(challengeToken) || typeof message !== 'string') {
         throw new Error('Invalid wallet challenge.');
       }
       const parsed = parseSiweMessage(message);
-      if (!stillSelected() || parsed.domain !== arcNetwork.domain || parsed.uri !== arcNetwork.origin
+      if (!stillSelected() || parsed.domain !== expectedDomain || parsed.uri !== expectedOrigin
         || parsed.version !== '1' || parsed.chainId !== arcNetwork.id
         || parsed.address?.toLowerCase() !== wallet.address.toLowerCase()
         || !parsed.nonce || !parsed.expirationTime || parsed.expirationTime.getTime() <= Date.now()) {
         throw new Error('The wallet or authentication challenge changed.');
       }
-      await assertWalletProvider(provider, wallet.address);
+      if (!circleSign) await assertWalletProvider(provider, wallet.address);
       if (!stillSelected()) throw new Error('The connected wallet changed.');
-      const signature = await provider.request({ method: 'personal_sign', params: [stringToHex(message), wallet.address] });
-      await assertWalletProvider(provider, wallet.address);
+      const signature = circleSign ? await circleSign({ wallet, message, challengeToken })
+        : await provider.request({ method: 'personal_sign', params: [stringToHex(message), wallet.address] });
+      if (!circleSign) await assertWalletProvider(provider, wallet.address);
       if (!stillSelected()) throw new Error('The connected wallet changed.');
       const result = await send('verify', { challengeToken, message, signature });
       if (typeof result.sessionToken !== 'string' || !/^[a-f0-9]{64}$/.test(result.sessionToken)
@@ -87,10 +147,7 @@ export function createWalletSession({ getWallet, getProvider, url, origin, fetch
         throw new Error('The connected wallet changed.');
       }
       if (current) revoke(current);
-      clearTimeout(expiryTimer);
-      current = next;
-      expiryTimer = setTimeout(invalidate, Math.min(12 * 60_000, next.expires - Date.now()));
-      onChange();
+      activate(next);
     };
     const pending = operation();
     inFlight = pending;
@@ -98,7 +155,27 @@ export function createWalletSession({ getWallet, getProvider, url, origin, fetch
   };
 
   return {
-    authenticate, invalidate, isAuthenticated: () => Boolean(snapshot()),
+    authenticate, restore, invalidate, isAuthenticated: () => Boolean(snapshot()),
+    ...(circleSign && {
+      async requestManagedInvoice(action, body) {
+        const auth = snapshot();
+        if (!auth || origin() !== arcNetwork.origin) throw new Error('Verify ownership of the selected Circle wallet.');
+        try {
+          const result = await fetchRequest('/api/termul-circle-managed', {
+            method: 'POST', cache: 'no-store', redirect: 'error', credentials: 'omit', signal: AbortSignal.timeout(40_000),
+            headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + auth.token },
+            body: JSON.stringify({ ...body, action }),
+          });
+          const data = await result.json();
+          if (!result.ok) throw Object.assign(new Error(data.error || 'Managed invoices are unavailable.'), { status: result.status, code: data.code });
+          if (snapshot() !== auth) throw new Error('The wallet session changed.');
+          return data;
+        } catch (error) {
+          if (error.status === 401 && snapshot() === auth) invalidate();
+          throw error;
+        }
+      },
+    }),
     async request(action, body, expectedAddress) {
       const auth = snapshot();
       if (!auth || (expectedAddress && auth.wallet.address.toLowerCase() !== expectedAddress.toLowerCase())) {
